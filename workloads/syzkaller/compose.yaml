@@ -1,0 +1,34 @@
+# Single-container syzkaller determinism workload.
+#
+# One service: a container whose /opt/bedrock/drivers/ directory holds a
+# standalone binary for every program in the syzkaller corpus (compiled at
+# image-build time, see Dockerfile + build.sh). The bedrock-io module
+# enumerates those binaries per-container for the ACTION_GET_WORKLOAD_DETAILS
+# RPC; the fuzzer/lab picks (container, driver) targets and execs each
+# syscall program under the deterministic hypervisor.
+#
+# The container signals VM-ready on start, then idles. After a long sleep it
+# issues bedrock's shutdown VMCALL as a safety net so an unattended run
+# eventually powers off. Determinism (TSC/RDRAND/interrupts/IP+MAC) is
+# provided by the hypervisor, not pinned here.
+#
+# The image comes from images.tar (built by ./build.sh) — never pulled. The
+# `image:` ref uses a bare name (no `docker.io/` registry prefix) so podman's
+# fallback resolution finds the `localhost/...` tag it adds at load time.
+
+services:
+  syzkaller:
+    image: bedrock/syzkaller:latest
+    pull_policy: never
+    container_name: syzkaller
+    privileged: true  # Required for VMCALL
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Signaling VM ready..."
+        /usr/local/bin/bedrock-vmcall --ready
+        echo "syzkaller drivers: $(find /opt/bedrock/drivers -type f -perm -100 | wc -l) programs"
+        echo "Idling 60 minutes before shutdown VMCALL..."
+        sleep 3600
+        echo "Initiating VM shutdown..."
+        exec /usr/local/bin/bedrock-vmcall
