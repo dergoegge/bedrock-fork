@@ -73,6 +73,14 @@ const ACTION_GET_WORKLOAD_DETAILS: u32 = 0;
 const ACTION_EXEC_BASH: u32 = 1;
 const ACTION_EXEC_HOST_BASH: u32 = 2;
 
+/// Feedback-buffer id under which `bedrock-io.ko` publishes the full workload
+/// listing, bypassing the 4 KB I/O-response cap. Must match `WORKLOAD_FB_ID`
+/// in the guest module. The buffer holds a little-endian `u64` byte count
+/// ([`WORKLOAD_FB_LEN_PREFIX`] bytes) followed by that many listing bytes.
+pub(crate) const WORKLOAD_FEEDBACK_ID: &[u8] = b"bedrock-io-workload";
+/// Width of the length prefix at the start of the workload feedback buffer.
+pub(crate) const WORKLOAD_FB_LEN_PREFIX: usize = 8;
+
 const REQUEST_HEADER_LEN: usize = 12;
 const RESPONSE_HEADER_LEN: usize = 20;
 
@@ -146,7 +154,7 @@ fn decode_envelope(bytes: &[u8]) -> Result<Envelope<'_>, String> {
     })
 }
 
-fn parse_workload_listing(data: &[u8]) -> Vec<WorkloadDriver> {
+pub(crate) fn parse_workload_listing(data: &[u8]) -> Vec<WorkloadDriver> {
     let text = String::from_utf8_lossy(data);
     let mut drivers = Vec::new();
     for line in text.lines() {

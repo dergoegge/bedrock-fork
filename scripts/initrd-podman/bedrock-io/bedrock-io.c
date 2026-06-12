@@ -60,7 +60,9 @@
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <linux/gfp.h>
 #include <linux/mempool.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
@@ -70,6 +72,7 @@
 #include <linux/umh.h>
 #include <linux/workqueue.h>
 
+#define HYPERCALL_REGISTER_FEEDBACK_BUFFER 2ULL
 #define HYPERCALL_IO_REGISTER_PAGE 4ULL
 #define HYPERCALL_IO_GET_REQUEST   5ULL
 #define HYPERCALL_IO_PUT_RESPONSE  6ULL
@@ -91,6 +94,25 @@
 
 #define OUTPUT_PATH_FMT "/tmp/bedrock-io-output-%u"
 #define OUTPUT_PATH_MAX 64
+
+/*
+ * Feedback-buffer transport for the workload listing.
+ *
+ * The shared response page caps inline data at BEDROCK_IO_PAGE_SIZE minus
+ * the header (~4076 bytes, ~54 driver lines). For workloads with many
+ * drivers that truncates the listing. Instead, register a separate, larger
+ * feedback buffer (the same mechanism guest processes use for coverage maps)
+ * and write the full listing there; the host pulls it by id with no 4KB cap.
+ *
+ * Buffer layout: u64 little-endian byte count of the listing, followed by
+ * that many listing bytes. WORKLOAD_FB_MAX_PAGES matches the hypervisor's
+ * FEEDBACK_BUFFER_MAX_PAGES (256 pages = 1 MiB), so the listing can hold
+ * ~13k driver lines. If the buffer can't be allocated or registered the
+ * worker silently falls back to the inline (capped) response.
+ */
+#define WORKLOAD_FB_ID          "bedrock-io-workload"
+#define WORKLOAD_FB_LEN_PREFIX  8U
+#define WORKLOAD_FB_MAX_PAGES   256U
 
 struct io_request_header {
 	__u32 magic;
@@ -118,6 +140,14 @@ struct bedrock_io_work {
 };
 
 static void *shared_page;
+/*
+ * Large feedback buffer carrying the full workload listing (see
+ * WORKLOAD_FB_ID). `workload_fb` is NULL and `workload_fb_size` 0 when the
+ * buffer couldn't be allocated/registered, in which case the worker uses the
+ * inline (capped) response instead.
+ */
+static void *workload_fb;
+static size_t workload_fb_size;
 static struct workqueue_struct *io_wq;
 /* Serialises access to `shared_page` for the VMCALL handshakes only —
  * the slow call_usermodehelper / kernel_read runs outside the lock. */
@@ -165,6 +195,28 @@ static inline __u64 vmcall0(__u64 nr)
 		     : "a"(nr)
 		     : "memory");
 	return result;
+}
+
+/*
+ * Register a feedback buffer with the hypervisor. ABI matches the userspace
+ * miner: RAX = HYPERCALL_REGISTER_FEEDBACK_BUFFER, RBX = buffer GVA,
+ * RCX = size, RDX = id GVA, RSI = id length. Returns the assigned slot index
+ * (0..MAX_FEEDBACK_BUFFERS) on success or ~0 on failure.
+ */
+static inline __u64 vmcall_register_feedback(__u64 buf, __u64 size,
+					     __u64 id, __u64 id_len)
+{
+	register __u64 rax asm("rax") = HYPERCALL_REGISTER_FEEDBACK_BUFFER;
+	register __u64 rbx asm("rbx") = buf;
+	register __u64 rcx asm("rcx") = size;
+	register __u64 rdx asm("rdx") = id;
+	register __u64 rsi asm("rsi") = id_len;
+
+	asm volatile("vmcall"
+		     : "+r"(rax)
+		     : "r"(rbx), "r"(rcx), "r"(rdx), "r"(rsi)
+		     : "memory");
+	return rax;
 }
 
 /*
@@ -644,13 +696,42 @@ static void bedrock_io_work_fn(struct work_struct *work)
 	resp_data_cap = BEDROCK_IO_PAGE_SIZE - sizeof(resp_hdr);
 	memset(resp_data, 0, resp_data_cap);
 	if (req_hdr.action_id == ACTION_GET_WORKLOAD_DETAILS) {
-		data_read = read_output_file(output_path, resp_data,
-					     resp_data_cap);
-		if (data_read < 0) {
-			pr_warn("bedrock-io: read_output_file(%s) failed: %zd\n",
-				output_path, data_read);
-			read_status = (__s32)data_read;
+		if (workload_fb) {
+			/*
+			 * Large transport: write the full listing into the
+			 * feedback buffer as `u64 length | bytes`, and leave
+			 * the inline response empty (data_len = 0). Writing
+			 * under page_mutex serialises concurrent
+			 * GET_WORKLOAD_DETAILS workers on the single buffer.
+			 * The host reads it by id while the VM is paused at
+			 * the PUT_RESPONSE exit, so it always sees this
+			 * worker's bytes.
+			 */
+			ssize_t n = read_output_file(
+				output_path,
+				(__u8 *)workload_fb + WORKLOAD_FB_LEN_PREFIX,
+				workload_fb_size - WORKLOAD_FB_LEN_PREFIX);
+			__u64 listing_len;
+
+			if (n < 0) {
+				pr_warn("bedrock-io: read_output_file(%s) failed: %zd\n",
+					output_path, n);
+				read_status = (__s32)n;
+				n = 0;
+			}
+			listing_len = (__u64)n;
+			memcpy(workload_fb, &listing_len, sizeof(listing_len));
 			data_read = 0;
+		} else {
+			/* Fallback: inline (capped) listing in the response. */
+			data_read = read_output_file(output_path, resp_data,
+						     resp_data_cap);
+			if (data_read < 0) {
+				pr_warn("bedrock-io: read_output_file(%s) failed: %zd\n",
+					output_path, data_read);
+				read_status = (__s32)data_read;
+				data_read = 0;
+			}
 		}
 	}
 
@@ -781,6 +862,45 @@ static int __init bedrock_io_init(void)
 		return err;
 	}
 
+	/*
+	 * Allocate + register the workload-listing feedback buffer. This is
+	 * best-effort: any failure leaves workload_fb NULL and the worker
+	 * falls back to the inline (capped) listing, so it never aborts init.
+	 * Try the full size first, halving the page order on allocation
+	 * failure so a fragmented allocator still yields a usable buffer.
+	 */
+	{
+		unsigned int order = get_order(WORKLOAD_FB_MAX_PAGES * PAGE_SIZE);
+
+		for (;;) {
+			workload_fb = (void *)__get_free_pages(
+				GFP_KERNEL | __GFP_ZERO, order);
+			if (workload_fb || order == 0)
+				break;
+			order--;
+		}
+		if (workload_fb) {
+			__u64 slot;
+
+			workload_fb_size = ((size_t)1 << order) * PAGE_SIZE;
+			slot = vmcall_register_feedback(
+				(__u64)workload_fb, (__u64)workload_fb_size,
+				(__u64)WORKLOAD_FB_ID,
+				(__u64)(sizeof(WORKLOAD_FB_ID) - 1));
+			if (slot == ~0ULL) {
+				pr_warn("bedrock-io: workload feedback buffer registration failed; using inline (capped) listing\n");
+				free_pages((unsigned long)workload_fb, order);
+				workload_fb = NULL;
+				workload_fb_size = 0;
+			} else {
+				pr_info("bedrock-io: workload feedback buffer registered slot=%llu size=%zu\n",
+					slot, workload_fb_size);
+			}
+		} else {
+			pr_warn("bedrock-io: could not allocate workload feedback buffer; using inline (capped) listing\n");
+		}
+	}
+
 	pr_info("bedrock-io: registered page=%p irq=%d (parallel workers)\n",
 		shared_page, BEDROCK_IO_IRQ);
 	return 0;
@@ -794,6 +914,9 @@ static void __exit bedrock_io_exit(void)
 	 * to destroy. */
 	destroy_workqueue(io_wq);
 	mempool_destroy(work_pool);
+	if (workload_fb)
+		free_pages((unsigned long)workload_fb,
+			   get_order(workload_fb_size));
 	free_page((unsigned long)shared_page);
 }
 

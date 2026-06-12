@@ -681,12 +681,48 @@ impl Branch {
     pub fn workload_details(&mut self) -> Result<Vec<WorkloadDriver>> {
         let request = bash::encode_workload_details_request();
         let bytes = self.run_io_action(&request)?;
-        match bash::decode_response(&bytes).map_err(LabError::BadResponse)? {
-            ActionResponse::WorkloadDetails(drivers) => Ok(drivers),
-            other => Err(LabError::BadResponse(format!(
-                "expected workload-details response, got {other:?}"
-            ))),
+        let inline = match bash::decode_response(&bytes).map_err(LabError::BadResponse)? {
+            ActionResponse::WorkloadDetails(drivers) => drivers,
+            other => {
+                return Err(LabError::BadResponse(format!(
+                    "expected workload-details response, got {other:?}"
+                )))
+            }
+        };
+        // Prefer the feedback-buffer transport, which carries the full
+        // listing without the 4 KB I/O-response cap. The guest module
+        // publishes it under `WORKLOAD_FEEDBACK_ID`; if no such buffer is
+        // present (older guest, or allocation failed) fall back to the
+        // inline — and possibly truncated — listing from the response.
+        match self.read_workload_feedback()? {
+            Some(drivers) => Ok(drivers),
+            None => Ok(inline),
         }
+    }
+
+    /// Read the workload listing from the feedback buffer the guest module
+    /// registers under [`bash::WORKLOAD_FEEDBACK_ID`]. Returns `None` if no
+    /// such buffer is registered (the caller then uses the inline listing).
+    ///
+    /// The buffer holds a little-endian `u64` byte count followed by that many
+    /// listing bytes; reads on this branch see its own copy-on-write view, so
+    /// the bytes reflect the listing written during the just-completed RPC.
+    fn read_workload_feedback(&mut self) -> Result<Option<Vec<WorkloadDriver>>> {
+        let bufs = self.feedback_buffers_to_vec(bash::WORKLOAD_FEEDBACK_ID)?;
+        let Some(buf) = bufs.into_iter().next() else {
+            return Ok(None);
+        };
+        if buf.len() < bash::WORKLOAD_FB_LEN_PREFIX {
+            return Ok(None);
+        }
+        let len = u64::from_le_bytes(
+            buf[..bash::WORKLOAD_FB_LEN_PREFIX]
+                .try_into()
+                .expect("slice is exactly WORKLOAD_FB_LEN_PREFIX bytes"),
+        ) as usize;
+        let start = bash::WORKLOAD_FB_LEN_PREFIX;
+        let end = start.saturating_add(len).min(buf.len());
+        Ok(Some(bash::parse_workload_listing(&buf[start..end])))
     }
 
     /// Carve out an immutable [`Checkpoint`] at the current point, consuming
