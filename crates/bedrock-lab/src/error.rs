@@ -23,6 +23,12 @@ pub enum LabError {
     /// ancestor checkpoint exists at or before the target time.
     NoCheckpointBefore { target: VirtTime },
 
+    /// [`Checkpoint::rewind`](crate::Checkpoint::rewind) replayed the recorded
+    /// input suffix but could not reach the target time — the guest consumed
+    /// more randomness than the recording holds, which means the line is no
+    /// longer deterministic with respect to its recording.
+    RewindReplayIncomplete { target: VirtTime },
+
     /// Two times were combined with mismatched TSC frequencies.
     FrequencyMismatch { lhs: u64, rhs: u64 },
 
@@ -60,6 +66,10 @@ impl fmt::Display for LabError {
             Self::NoCheckpointBefore { target } => write!(
                 f,
                 "no ancestor checkpoint at or before {target:?}"
+            ),
+            Self::RewindReplayIncomplete { target } => write!(
+                f,
+                "rewind replay could not reach {target:?}: recording exhausted before the target (non-deterministic line)"
             ),
             Self::FrequencyMismatch { lhs, rhs } => {
                 write!(f, "TSC frequency mismatch: {lhs} vs {rhs}")

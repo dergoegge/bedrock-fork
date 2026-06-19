@@ -2,20 +2,21 @@
 
 //! Checkpoints — immutable moments in virtual time.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use bedrock_vm::file_xfer::FileServer;
 use bedrock_vm::{
     EventCategories, EventConfig as VmEventConfig, ExitKind, RdrandConfig, Vm, VmError,
 };
 
-use crate::branch::{Branch, BranchId};
+use crate::branch::{Branch, BranchId, RunOutcome};
 use crate::error::{LabError, Result};
 use crate::event::{
     drain_serial_events, emit_feedback_buffer_registered, Discard, Event, EventSink, PartialLine,
 };
-use crate::inner::LabInner;
-use crate::rng::{InputRecording, InputSource, IoInput, RngMode};
+use crate::inner::{LabInner, PrefixLoc, RewindPlan};
+use crate::radix::NodeId;
+use crate::rng::{InputRecording, InputSource, IoInput, RecordedInputSource, RngMode};
 use crate::time::{VirtDuration, VirtTime};
 use crate::tree::Tree;
 
@@ -65,6 +66,47 @@ impl Default for LabOpts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CheckpointId(pub(crate) u64);
 
+/// Where a candidate input recording sits relative to everything the tree has
+/// already executed — the result of [`Checkpoint::longest_checkpoint_prefix`].
+///
+/// It splits the candidate into three consecutive spans along the genealogy:
+///
+/// - **already checkpointed** — the inputs captured by [`start`](Self::start),
+///   the deepest existing checkpoint whose recording is a prefix of the
+///   candidate. This is the best place to fork from; reaching it is free.
+/// - **replay** ([`replay`](Self::replay)) — the recorded inputs between
+///   `start` and the point the candidate first leaves every known path. They
+///   were executed before (they lie on an existing trie path) but no checkpoint
+///   was kept along them, so reaching the divergence means forking `start` and
+///   re-running these forward.
+/// - **new** ([`new`](Self::new)) — the inputs from the divergence onward, which
+///   the tree has never executed.
+///
+/// The replay/new boundary is reported as a virtual *time*
+/// ([`diverges_at`](Self::diverges_at)), not merely a token count: the idle
+/// stretch between the last replayed input and the first diverging one is itself
+/// replay ground — reaching the divergence means running `start` forward to
+/// `diverges_at` even across input-free time. So a non-empty replay span is *not*
+/// the only thing that implies replay work; `diverges_at > start.time()` does
+/// too. `diverges_at` is `None` exactly when the candidate never leaves known
+/// ground (it is a prefix of, or equal to, an existing path); then
+/// [`new`](Self::new) is empty and [`replay`](Self::replay) carries the whole
+/// tail past `start`.
+#[derive(Debug, Clone)]
+pub struct PrefixMatch {
+    /// Deepest checkpoint whose recording is a prefix of the candidate.
+    pub start: Checkpoint,
+    /// Recorded inputs between `start` and the divergence, replayed forward
+    /// from `start` to reproduce the shared execution.
+    pub replay: InputRecording,
+    /// Candidate inputs from the divergence onward — the genuinely new path.
+    pub new: InputRecording,
+    /// Virtual time at which the candidate first diverges from every known
+    /// path: the boundary between [`replay`](Self::replay) and [`new`](Self::new).
+    /// `None` if it never diverges.
+    pub diverges_at: Option<VirtTime>,
+}
+
 /// An immutable moment in virtual time — a halted VM that can be forked into
 /// one or more [`Branch`]es.
 ///
@@ -82,9 +124,6 @@ pub(crate) struct CheckpointInner {
     pub(crate) time: VirtTime,
     /// The halted VM. Used only as a `vm.fork()` source — never run again.
     pub(crate) vm: Vm,
-    /// VM replay parent. This is the checkpoint whose VM state was forked to
-    /// construct this checkpoint's VM state. It never changes.
-    pub(crate) _vm_parent: Option<Weak<CheckpointInner>>,
     pub(crate) lab: Arc<LabInner>,
     /// Serial line in progress at the moment this checkpoint was taken.
     /// Descendant branches start with this prepended so a line that
@@ -255,7 +294,6 @@ impl Checkpoint {
             id,
             time,
             vm,
-            _vm_parent: None,
             lab: lab.clone(),
             partial_line,
             input_source,
@@ -263,7 +301,7 @@ impl Checkpoint {
             input_io_exhausted: false,
             input_recording: InputRecording::new(),
         });
-        lab.graph.lock().unwrap().register_checkpoint(&inner, None);
+        lab.graph.lock().unwrap().register(&inner);
         lab.sink.on_event(Event::CheckpointCreated {
             checkpoint: id,
             from_branch: None,
@@ -352,11 +390,11 @@ impl Checkpoint {
         Ok(branch)
     }
 
-    /// Logical parent checkpoint in the lab tree, if any. `None` for the root.
+    /// Parent checkpoint in the lab tree, if any. `None` for the root.
     ///
-    /// This is the user-facing ancestry used by [`Tree`](crate::Tree). It may
-    /// differ from the underlying VM replay parent for checkpoints created by
-    /// [`Checkpoint::rewind`].
+    /// The parent is the closest ancestor on this checkpoint's line: the nearest
+    /// checkpoint whose input recording is a prefix of this one's. This is the
+    /// ancestry [`Tree`](crate::Tree) renders.
     pub fn parent(&self) -> Option<Checkpoint> {
         self.inner
             .lab
@@ -367,18 +405,101 @@ impl Checkpoint {
             .map(|inner| Checkpoint { inner })
     }
 
+    /// Locate a candidate input recording against this tree's genealogy: find
+    /// the deepest existing checkpoint whose recording is a prefix of
+    /// `candidate`, and classify the rest of the candidate into the inputs that
+    /// merely *replay* previously-executed ground and the inputs that strike out
+    /// on a *new* path. See [`PrefixMatch`].
+    ///
+    /// This is a read-only query — it forks and runs nothing. The intended use
+    /// is to start a new line from the deepest shared checkpoint instead of from
+    /// the root: fork [`PrefixMatch::start`], replay
+    /// [`PrefixMatch::replay`] forward to [`PrefixMatch::diverges_at`] (exactly
+    /// as [`Checkpoint::rewind`] replays a recorded suffix), then drive the new
+    /// inputs from there.
+    ///
+    /// `candidate` is matched on its canonical token sequence (see
+    /// [`InputRecording`]), so it must be supplied as a recording — what
+    /// [`input_recording`](Self::input_recording) /
+    /// [`Branch::input_recording`](crate::Branch::input_recording) expose, or
+    /// the recording behind a [`RecordedInputSource`] (use
+    /// [`longest_checkpoint_prefix_of`](Self::longest_checkpoint_prefix_of)).
+    ///
+    /// Returns `None` only if no checkpoint at all is a prefix of `candidate`
+    /// (not even the root — e.g. the root checkpoint has been dropped).
+    pub fn longest_checkpoint_prefix(&self, candidate: &InputRecording) -> Option<PrefixMatch> {
+        let loc = self
+            .inner
+            .lab
+            .graph
+            .lock()
+            .unwrap()
+            .locate_prefix(candidate)?;
+        Some(PrefixMatch::from(loc))
+    }
+
+    /// [`longest_checkpoint_prefix`](Self::longest_checkpoint_prefix) for the
+    /// recording backing a [`RecordedInputSource`].
+    pub fn longest_checkpoint_prefix_of(
+        &self,
+        source: &RecordedInputSource,
+    ) -> Option<PrefixMatch> {
+        self.longest_checkpoint_prefix(source.recording())
+    }
+
+    /// Retain this checkpoint's input prefix in the genealogy as a corpus entry,
+    /// returning a [`RetainedInput`] handle.
+    ///
+    /// Admission pins the *input*, not the VM: the recording's trie node survives
+    /// even after this checkpoint's VM is dropped (e.g. evicted from a live LRU),
+    /// so the prefix stays classifiable as known and **revivable** — re-derivable
+    /// by forking the deepest live ancestor and replaying the recorded suffix.
+    /// The expensive VM remains an ordinary eviction candidate; only the cheap
+    /// input path is held. Dropping the returned handle releases the anchor, and
+    /// the node is pruned unless something else still anchors it.
+    pub fn retain(&self) -> RetainedInput {
+        let recording = self.inner.input_recording.clone();
+        let node = self.inner.lab.graph.lock().unwrap().retain(&recording);
+        RetainedInput {
+            lab: self.inner.lab.clone(),
+            node,
+            recording,
+        }
+    }
+
     /// Take a new [`Checkpoint`] at `self.time() - by`.
     ///
-    /// Walks `self`'s ancestry for the latest checkpoint whose time is at or
-    /// before the target, forks a fresh VM from it, replays forward to the
-    /// exact target time, and freezes the result into a new checkpoint.
+    /// Resolves the rewind against the genealogy trie
+    /// ([`Genealogy::rewind_plan`](crate::inner::RewindPlan)): the inputs `self`
+    /// consumed up to the target time are a prefix of its
+    /// [`input_recording`](Checkpoint::input_recording), and the deepest existing
+    /// checkpoint on that prefix at or before the target is forked and replayed
+    /// forward to the exact target time. Replaying the line's own *recorded*
+    /// inputs reproduces its exact state regardless of RNG mode or any
+    /// [`branch_with_input_source`](Checkpoint::branch_with_input_source)
+    /// override taken along the way.
     ///
-    /// If a logical ancestor checkpoint or a prior rewind-created checkpoint
-    /// already sits at exactly the target time, that checkpoint is returned
-    /// directly without replaying or adding a new node.
+    /// If a checkpoint already sits at exactly the target `(input prefix, time)`,
+    /// it is returned directly without replaying or adding a node.
     ///
-    /// Errors with [`LabError::NoCheckpointBefore`] if no ancestor checkpoint
-    /// is early enough.
+    /// The replay mechanism follows the line's randomness mode, read from
+    /// `self`:
+    ///
+    /// - **Sourced line** (a userspace [`InputSource`](crate::InputSource) drove
+    ///   it): the recorded suffix is fed back through a [`RecordedInputSource`],
+    ///   so the rewound checkpoint is itself in replay mode (its recording is
+    ///   exhausted). To explore a *new* future from it, fork with
+    ///   [`branch_with_input_source`](Checkpoint::branch_with_input_source) and
+    ///   supply fresh input.
+    /// - **Kernel-seeded line**: randomness is reproduced by the VM-state CoW, so
+    ///   only the recorded I/O suffix is re-scheduled; the rewound checkpoint
+    ///   stays seeded and a plain [`branch`](Checkpoint::branch) keeps drawing
+    ///   fresh seeded randomness.
+    ///
+    /// Errors with [`LabError::NoCheckpointBefore`] if no checkpoint is at or
+    /// before the target time, or [`LabError::RewindReplayIncomplete`] if the
+    /// replay cannot reach the target (a sign of residual non-determinism — the
+    /// recording no longer matches what the guest consumes).
     pub fn rewind(&self, by: VirtDuration) -> Result<Checkpoint> {
         if by.frequency() != self.inner.lab.tsc_frequency {
             return Err(LabError::FrequencyMismatch {
@@ -388,55 +509,51 @@ impl Checkpoint {
         }
         let target = self.inner.time - by;
 
-        let candidates = self.rewind_candidates(target);
-        if let Some(cp) = candidates.iter().find(|cp| cp.time() == target) {
-            return Ok(cp.clone());
-        }
-        let Some(best) = candidates.into_iter().max_by_key(|cp| (cp.time(), cp.id())) else {
-            return Err(LabError::NoCheckpointBefore { target });
-        };
-
-        let mut tmp = best.branch()?;
-        tmp.run_until(target)?;
-        let cp = tmp.checkpoint()?;
-        let child = self
-            .logical_child_after(target, &best)
-            .unwrap_or_else(|| self.clone());
-        self.inner
+        // Resolve against the trie, then drop the lock before any fork/replay
+        // (which re-locks the graph to register the new checkpoint).
+        let plan = self
+            .inner
             .lab
             .graph
             .lock()
             .unwrap()
-            .reparent(child.id(), cp.id());
-        Ok(cp)
-    }
+            .rewind_plan(self.inner.id, target);
+        let (from, suffix) = match plan {
+            RewindPlan::Existing(inner) => return Ok(Checkpoint { inner }),
+            RewindPlan::Replay { from, suffix } => (Checkpoint { inner: from }, suffix),
+            RewindPlan::NoAncestor => return Err(LabError::NoCheckpointBefore { target }),
+        };
 
-    fn rewind_candidates(&self, target: VirtTime) -> Vec<Checkpoint> {
-        let mut candidates = Vec::new();
-
-        let mut walk = Some(self.clone());
-        while let Some(cp) = walk {
-            if cp.time() <= target {
-                candidates.push(cp.clone());
+        let mut tmp = if self.inner.input_source.is_some() {
+            // Sourced line: feed the recorded suffix (randomness + I/O) via
+            // exit-to-userspace. Correct even if the suffix crosses a
+            // branch_with_input_source override, since the recording is the
+            // ground truth for what reached the guest.
+            from.branch_with_input_source(RecordedInputSource::new(suffix))?
+        } else {
+            // Seeded line: the VM-state CoW reproduces randomness on its own;
+            // re-issue only the recorded I/O suffix on its original schedule.
+            let mut branch = from.branch()?;
+            for io in suffix.io_inputs() {
+                branch.sched_bash(io.at, io.target.clone(), &io.command, io.record_output)?;
             }
-            walk = cp.parent();
-        }
+            branch
+        };
 
-        candidates
-    }
-
-    fn logical_child_after(&self, target: VirtTime, ancestor: &Checkpoint) -> Option<Checkpoint> {
-        let mut child = self.clone();
         loop {
-            let parent = child.parent()?;
-            if parent.time() <= target && target < child.time() {
-                return Some(child);
+            let (at, outcome) = tmp.run_until(target)?;
+            match outcome {
+                RunOutcome::ReachedTime => break,
+                // Recorded I/O responses land mid-replay; keep pumping. `Ready`
+                // can recur on a replayed boot segment — also benign here.
+                RunOutcome::ActionResponse { .. } | RunOutcome::Ready => continue,
+                RunOutcome::RngExhausted => {
+                    return Err(LabError::RewindReplayIncomplete { target })
+                }
+                RunOutcome::Yielded { kind } => return Err(LabError::UnexpectedExit { at, kind }),
             }
-            if parent.id() == ancestor.id() {
-                return None;
-            }
-            child = parent;
         }
+        tmp.checkpoint()
     }
 
     /// Take a read-only snapshot of the entire tree this checkpoint belongs to.
@@ -450,6 +567,84 @@ impl std::fmt::Debug for Checkpoint {
         f.debug_struct("Checkpoint")
             .field("id", &self.inner.id)
             .field("time", &self.inner.time)
+            .finish()
+    }
+}
+
+impl From<PrefixLoc> for PrefixMatch {
+    fn from(loc: PrefixLoc) -> Self {
+        PrefixMatch {
+            start: Checkpoint { inner: loc.start },
+            replay: loc.replay,
+            new: loc.new,
+            diverges_at: loc.diverges_at,
+        }
+    }
+}
+
+impl Drop for CheckpointInner {
+    /// When a checkpoint's last handle goes away, its VM is freed — so tell the
+    /// genealogy to forget the registration and prune the now-unanchored node
+    /// (unless a [`RetainedInput`] still pins its input prefix). This is the
+    /// coordinated eviction that keeps the trie bounded by the live + retained
+    /// set rather than growing with every checkpoint ever taken.
+    fn drop(&mut self) {
+        // Best-effort: a poisoned lock during teardown is not worth panicking in
+        // a destructor over. `on_drop` only touches `Weak`s, never strong
+        // handles, so it cannot re-enter this `Drop`.
+        if let Ok(mut graph) = self.lab.graph.lock() {
+            graph.on_drop(self.id);
+        }
+    }
+}
+
+/// A retained input prefix — a corpus entry in the genealogy.
+///
+/// Created by [`Checkpoint::retain`]. While this handle is alive it anchors the
+/// recording's trie node, so the prefix stays known and revivable even after the
+/// checkpoint's VM has been dropped. The anchor holds only the (cheap) input
+/// recording, never the (expensive) VM. Dropping the handle releases the anchor;
+/// the node is then pruned unless something else still anchors it.
+pub struct RetainedInput {
+    lab: Arc<LabInner>,
+    node: NodeId,
+    recording: InputRecording,
+}
+
+impl RetainedInput {
+    /// The retained input recording — the corpus entry, replayable to reconstruct
+    /// the checkpoint it was taken from.
+    pub fn recording(&self) -> &InputRecording {
+        &self.recording
+    }
+
+    /// Locate this retained input against the genealogy, as
+    /// [`Checkpoint::longest_checkpoint_prefix`] does — the usual way to revive
+    /// it: fork [`PrefixMatch::start`] and replay forward. Returns `None` only if
+    /// not even the root checkpoint is live.
+    pub fn longest_checkpoint_prefix(&self) -> Option<PrefixMatch> {
+        let loc = self
+            .lab
+            .graph
+            .lock()
+            .unwrap()
+            .locate_prefix(&self.recording)?;
+        Some(PrefixMatch::from(loc))
+    }
+}
+
+impl Drop for RetainedInput {
+    fn drop(&mut self) {
+        if let Ok(mut graph) = self.lab.graph.lock() {
+            graph.release(self.node);
+        }
+    }
+}
+
+impl std::fmt::Debug for RetainedInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedInput")
+            .field("node", &self.node)
             .finish()
     }
 }

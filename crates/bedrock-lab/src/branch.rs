@@ -19,12 +19,16 @@ use crate::rng::{InputRecording, InputSource, IoInput};
 use crate::time::{VirtDuration, VirtTime};
 use crate::tree::Tree;
 
-/// Event categories the lab forces on while a branch has an [`InputSource`]
-/// attached. The deterministic *inputs* a branch consumes — served RDRAND/RDSEED
-/// values and queued I/O requests — are reconstructed from these records into
-/// the branch's [`InputRecording`], so they must be captured even when the
-/// caller's [`EventConfig`] asks for nothing. They are cheap: one small record
-/// per consumed input, far below the cost of `Exit` capture.
+/// Event categories the lab forces on for *every* branch, regardless of RNG
+/// mode or the caller's [`EventConfig`]. The deterministic *inputs* a branch
+/// consumes — served RDRAND/RDSEED/GET_RANDOM values (kernel-side seeded values
+/// included; see `rdrand.rs`'s emit on the `generate()` path) and queued I/O
+/// requests — are reconstructed from these records into the branch's
+/// [`InputRecording`]. That recording is the genealogy trie's key and the
+/// replay script for [`Checkpoint::rewind`](crate::Checkpoint::rewind), so it
+/// must be *complete* on every line, not just when a userspace
+/// [`InputSource`](crate::InputSource) is attached. They are cheap: one small
+/// record per consumed input, far below the cost of `Exit` capture.
 const RECORDING_CATEGORIES: EventCategories =
     EventCategories::RANDOMNESS.union(EventCategories::IO_CHANNEL);
 
@@ -288,39 +292,35 @@ impl Branch {
     /// as [`Event::Record`]. Forked VMs start with the stream disabled
     /// regardless of the parent's setting, so each branch enables it explicitly.
     ///
-    /// On a branch with an [`InputSource`], the `RANDOMNESS` and `IO_CHANNEL`
-    /// categories are always added on top of `config` so the branch's
-    /// [`InputRecording`](crate::InputRecording) keeps being reconstructed from
-    /// the stream — passing a `config` that omits them does not turn recording
-    /// off.
+    /// The `RANDOMNESS` and `IO_CHANNEL` categories are always added on top of
+    /// `config` so the branch's [`InputRecording`](crate::InputRecording) keeps
+    /// being reconstructed from the stream on every line, regardless of RNG mode
+    /// — passing a `config` that omits them does not turn recording off.
     pub fn set_event_config(&mut self, config: &EventConfig) -> Result<()> {
         self.event_config = *config;
         self.apply_event_config()
     }
 
     /// Lower [`self.event_config`](Self::event_config) to the kernel, forcing on
-    /// the lab's always-captured categories: `SERIAL` on every branch (so guest
-    /// console output surfaces as [`Event::SerialLine`]), plus
-    /// `RECORDING_CATEGORIES` while this branch has an [`InputSource`] so its
-    /// [`InputRecording`](crate::InputRecording) can be reconstructed from the
-    /// stream. Every path that (re)installs the branch's capture config goes
-    /// through here so these categories are never accidentally dropped.
+    /// the lab's always-captured categories: `SERIAL` (so guest console output
+    /// surfaces as [`Event::SerialLine`]) plus `RECORDING_CATEGORIES` (so the
+    /// branch's [`InputRecording`](crate::InputRecording) is reconstructed from
+    /// the stream). Both are forced on for *every* branch in *every* RNG mode —
+    /// the recording must be complete to serve as the genealogy key and rewind
+    /// replay script. Every path that (re)installs the branch's capture config
+    /// goes through here so these categories are never accidentally dropped.
     fn apply_event_config(&mut self) -> Result<()> {
-        let mut extra = EventCategories::SERIAL;
-        if self.input_source.is_some() {
-            extra = extra.union(RECORDING_CATEGORIES);
-        }
+        let extra = EventCategories::SERIAL.union(RECORDING_CATEGORIES);
         let vm_config = self.event_config.to_vm_config_with(extra);
         self.send_event_config(&vm_config)
     }
 
     /// Enable the lab's always-on event capture on a freshly forked branch:
-    /// turn on `SERIAL` (for [`Event::SerialLine`]) and, when the branch carries
-    /// an [`InputSource`], `RECORDING_CATEGORIES` (so consumed RDRAND/RDSEED
-    /// values and I/O requests are captured into
-    /// [`input_recording`](Self::input_recording)). Called once at branch
-    /// creation. Forked VMs start with the stream disabled, so this is what
-    /// turns it on.
+    /// turn on `SERIAL` (for [`Event::SerialLine`]) and `RECORDING_CATEGORIES`
+    /// (so consumed RDRAND/RDSEED/GET_RANDOM values and I/O requests are captured
+    /// into [`input_recording`](Self::input_recording) on every line). Called
+    /// once at branch creation. Forked VMs start with the stream disabled, so
+    /// this is what turns it on.
     pub(crate) fn enable_event_capture(&mut self) -> Result<()> {
         self.apply_event_config()
     }
@@ -372,13 +372,12 @@ impl Branch {
         // Capture every exit within the range via the `TscRange` trigger. Memory
         // hashing on every single-stepped instruction would dominate run time
         // and adds no signal — register state already pins down divergence at
-        // instruction granularity. Keep `SERIAL` on (and the input-recording
-        // categories, when sourced) so console output and consumed randomness/IO
-        // inside the window still surface.
-        let mut categories = EventCategories::EXIT.union(EventCategories::SERIAL);
-        if self.input_source.is_some() {
-            categories = categories.union(RECORDING_CATEGORIES);
-        }
+        // instruction granularity. Keep `SERIAL` and the input-recording
+        // categories on so console output and consumed randomness/IO inside the
+        // window still surface and the recording stays complete.
+        let categories = EventCategories::EXIT
+            .union(EventCategories::SERIAL)
+            .union(RECORDING_CATEGORIES);
         let config = VmEventConfig::enabled(categories)
             .with_exit_trigger(ExitTrigger::TscRange, 0)
             .with_no_memory_hash();
@@ -443,9 +442,10 @@ impl Branch {
     /// is `VmExit::event_len` from the just-returned `vm.run()` ioctl — the
     /// number of valid bytes in the event buffer.
     ///
-    /// Inputs are captured only while a source is attached, matching the old
-    /// imperative path (kernel-side RNG and direct `bash`/`sched_bash` on a
-    /// sourceless branch leave the recording empty).
+    /// Inputs are recorded on *every* branch in *every* RNG mode: the recording
+    /// is the genealogy trie's key and rewind's replay script, so it must be
+    /// complete (kernel-side seeded RDRAND values and direct `bash`/`sched_bash`
+    /// I/O included, not just userspace-`InputSource` traffic).
     ///
     /// The kernel resets the event cursor at the start of every `vm.run()`
     /// ioctl (`handlers.rs` `event_clear`), so `event_len` is *per-call*, not
@@ -462,7 +462,6 @@ impl Branch {
             vm,
             lab,
             id,
-            input_source,
             input_recording,
             partial,
             ..
@@ -472,7 +471,6 @@ impl Branch {
             return;
         };
         let drained = &buffer[..event_len.min(buffer.len())];
-        let record_inputs = input_source.is_some();
         let freq = lab.tsc_frequency;
         for record in EventStream::new(drained) {
             if record.kind() == EventKind::Serial.as_u16() {
@@ -488,9 +486,9 @@ impl Branch {
                 );
                 continue;
             }
-            if record_inputs {
-                input_recording.record_event(&record, freq);
-            }
+            // Reconstruct the recording on every branch regardless of RNG mode;
+            // it must be complete to key the genealogy and drive rewind replay.
+            input_recording.record_event(&record, freq);
             lab.sink.on_event(Event::Record {
                 branch: *id,
                 record,
@@ -984,7 +982,6 @@ impl Branch {
             id,
             time,
             vm,
-            _vm_parent: Some(Arc::downgrade(&self.origin.inner)),
             lab: self.lab.clone(),
             partial_line: core::mem::take(&mut self.partial),
             input_source: self.input_source.take(),
@@ -992,11 +989,7 @@ impl Branch {
             input_io_exhausted: self.input_io_exhausted,
             input_recording: core::mem::take(&mut self.input_recording),
         });
-        self.lab
-            .graph
-            .lock()
-            .unwrap()
-            .register_checkpoint(&inner, Some(parent_id));
+        self.lab.graph.lock().unwrap().register(&inner);
         self.lab.sink.on_event(Event::CheckpointCreated {
             checkpoint: id,
             from_branch: Some(from_branch),

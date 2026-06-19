@@ -59,15 +59,55 @@ pub struct RandomInput {
 /// Inputs consumed by a branch, suitable for replay.
 ///
 /// The recording is reconstructed from the branch's unified event stream rather
-/// than tracked separately: a branch with an [`InputSource`] forces on the
+/// than tracked separately: every branch forces on the
 /// [`Randomness`](bedrock_vm::Event::Randomness) and
-/// [`IoChannel`](bedrock_vm::Event::IoChannel) event categories, and every
-/// drained record is fed through [`record_event`](Self::record_event). The
-/// stream is therefore the single source of truth for what reached the guest.
+/// [`IoChannel`](bedrock_vm::Event::IoChannel) event categories (regardless of
+/// RNG mode — kernel-side seeded RDRAND emits a `Randomness` record too), and
+/// every drained record is fed through [`record_event`](Self::record_event). The
+/// stream is therefore the single, complete source of truth for what reached the
+/// guest, which is what lets it serve as both the genealogy trie's key and the
+/// replay script for [`Checkpoint::rewind`](crate::Checkpoint::rewind).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InputRecording {
     random_inputs: Vec<RandomInput>,
     io_inputs: Vec<IoInput>,
+    /// Arrival order across both streams — one entry per recorded input, in the
+    /// order [`record_event`](Self::record_event) saw them. The two streams are
+    /// stored separately for the public accessors, but the genealogy trie keys
+    /// on a *single* canonical sequence; this index reconstructs that
+    /// interleaving (see [`linearize`](Self::linearize)) without depending on
+    /// timestamps, so the prefix property holds even when a randomness and an
+    /// I/O input share an emit TSC.
+    order: Vec<Stream>,
+}
+
+/// Which of an [`InputRecording`]'s two streams a recorded input belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stream {
+    Random,
+    Io,
+}
+
+/// One input in a recording's canonical linearization: the single time-ordered
+/// sequence that merges the randomness and I/O streams in arrival order. This is
+/// the genealogy trie's edge alphabet. Because arrival order is append-only and
+/// monotonic in virtual time, if recording `A`'s inputs are a prefix of `B`'s
+/// then `A.linearize()` is a token-wise prefix of `B.linearize()` — the property
+/// the trie relies on to make "ancestor" mean "recording is a prefix".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecordingToken {
+    Random(RandomInput),
+    Io(IoInput),
+}
+
+impl RecordingToken {
+    /// Virtual time at which this input was served/queued.
+    pub(crate) fn at(&self) -> VirtTime {
+        match self {
+            RecordingToken::Random(r) => r.at,
+            RecordingToken::Io(i) => i.at,
+        }
+    }
 }
 
 impl InputRecording {
@@ -119,6 +159,7 @@ impl InputRecording {
                     pid,
                     bytes,
                 });
+                self.order.push(Stream::Random);
             }
             Event::IoChannel(meta, data) if meta.phase == IoChannelPhase::Request as u8 => {
                 let Some(req) = decode_request(data) else {
@@ -133,9 +174,51 @@ impl InputRecording {
                     command: req.command.into_owned(),
                     record_output: req.record_output,
                 });
+                self.order.push(Stream::Io);
             }
             _ => {}
         }
+    }
+
+    /// Flatten the two streams into the single canonical token sequence the
+    /// genealogy trie keys on, in the exact order the inputs were recorded.
+    pub(crate) fn linearize(&self) -> Vec<RecordingToken> {
+        let mut tokens = Vec::with_capacity(self.order.len());
+        let (mut ri, mut ii) = (0usize, 0usize);
+        for stream in &self.order {
+            match stream {
+                Stream::Random => {
+                    tokens.push(RecordingToken::Random(self.random_inputs[ri].clone()));
+                    ri += 1;
+                }
+                Stream::Io => {
+                    tokens.push(RecordingToken::Io(self.io_inputs[ii].clone()));
+                    ii += 1;
+                }
+            }
+        }
+        tokens
+    }
+
+    /// Rebuild a recording from a canonical token slice — the inverse of
+    /// [`linearize`](Self::linearize). Used to package the suffix of inputs a
+    /// [`Checkpoint::rewind`](crate::Checkpoint::rewind) must replay into a
+    /// [`RecordedInputSource`].
+    pub(crate) fn from_tokens(tokens: &[RecordingToken]) -> Self {
+        let mut rec = Self::new();
+        for token in tokens {
+            match token {
+                RecordingToken::Random(r) => {
+                    rec.random_inputs.push(r.clone());
+                    rec.order.push(Stream::Random);
+                }
+                RecordingToken::Io(i) => {
+                    rec.io_inputs.push(i.clone());
+                    rec.order.push(Stream::Io);
+                }
+            }
+        }
+        rec
     }
 }
 

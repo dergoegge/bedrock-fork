@@ -5,7 +5,9 @@
 //! These exercise the pure decode path ([`InputRecording::record_event`]) with
 //! hand-built event bytes, so they need no VM and run under `cargo test`.
 
-use super::{InputRecording, InputSource, IoInput, RandomInput, RecordedInputSource};
+use super::{
+    InputRecording, InputSource, IoInput, RandomInput, RecordedInputSource, RecordingToken,
+};
 use crate::bash::BashTarget;
 use crate::time::VirtTime;
 use bedrock_vm::events::{
@@ -270,4 +272,90 @@ fn recording_round_trips_through_replay_source() {
     assert_eq!(second.command, "second");
     assert!(second.record_output);
     assert!(source.next_io_input().is_none());
+}
+
+#[test]
+fn linearize_preserves_cross_stream_arrival_order_at_equal_tsc() {
+    // A randomness and an I/O input emitted at the *same* TSC must linearize in
+    // the order they were recorded — the genealogy trie's prefix property can't
+    // lean on timestamps to break cross-stream ties.
+    let mut buf = Vec::new();
+    io_record(
+        &mut buf,
+        0,
+        5_000,
+        IoChannelPhase::Request,
+        &encode_request(None, "io-first", false),
+    );
+    random_record(&mut buf, 1, 5_000, 0xFEED); // same TSC as the io above
+
+    let rec = recording_from(&buf);
+    let tokens = rec.linearize();
+    assert_eq!(tokens.len(), 2);
+    assert!(matches!(&tokens[0], RecordingToken::Io(i) if i.command == "io-first"));
+    assert!(matches!(&tokens[1], RecordingToken::Random(r) if r.bytes == 0xFEED_u64.to_le_bytes()));
+    // Both tokens report the shared emit time.
+    assert_eq!(tokens[0].at(), tokens[1].at());
+}
+
+#[test]
+fn linearize_has_prefix_property() {
+    // Build an interleaved recording, then confirm every truncation linearizes
+    // to a token-wise prefix of the whole — this is exactly the relation the
+    // trie uses for "ancestor".
+    let mut buf = Vec::new();
+    random_record(&mut buf, 0, 1_000, 0x11);
+    io_record(
+        &mut buf,
+        1,
+        2_000,
+        IoChannelPhase::Request,
+        &encode_request(None, "a", false),
+    );
+    random_record(&mut buf, 2, 2_000, 0x22); // equal TSC with the io before it
+    io_record(
+        &mut buf,
+        3,
+        3_000,
+        IoChannelPhase::Request,
+        &encode_request(Some("c1"), "b", true),
+    );
+
+    let full = recording_from(&buf);
+    let full_tokens = full.linearize();
+    assert_eq!(full_tokens.len(), 4);
+
+    for k in 0..=full_tokens.len() {
+        let prefix = &full_tokens[..k];
+        let rebuilt = InputRecording::from_tokens(prefix);
+        assert_eq!(
+            rebuilt.linearize(),
+            prefix.to_vec(),
+            "truncation to {k} tokens did not round-trip"
+        );
+        // Each rebuilt prefix is itself a prefix of the full token sequence.
+        assert_eq!(&full_tokens[..k], rebuilt.linearize().as_slice());
+    }
+}
+
+#[test]
+fn from_tokens_round_trips_streams_and_order() {
+    let mut buf = Vec::new();
+    random_record(&mut buf, 0, 1_000, 0xAA);
+    io_record(
+        &mut buf,
+        1,
+        2_000,
+        IoChannelPhase::Request,
+        &encode_request(None, "cmd", true),
+    );
+    random_record(&mut buf, 2, 3_000, 0xBB);
+
+    let rec = recording_from(&buf);
+    let rebuilt = InputRecording::from_tokens(&rec.linearize());
+
+    // Full structural equality, including the private arrival-order index.
+    assert_eq!(rec, rebuilt);
+    assert_eq!(rec.random_inputs(), rebuilt.random_inputs());
+    assert_eq!(rec.io_inputs(), rebuilt.io_inputs());
 }

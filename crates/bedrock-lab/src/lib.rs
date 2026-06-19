@@ -60,6 +60,7 @@ mod checkpoint;
 mod error;
 mod event;
 mod inner;
+mod radix;
 mod rng;
 mod time;
 mod tree;
@@ -67,7 +68,7 @@ mod tree;
 pub use bash::{BashOutput, BashTarget};
 pub use bedrock_vm::{EventCategories, EventRecord};
 pub use branch::{Branch, BranchId, EventConfig, ExitCapture, RunOutcome};
-pub use checkpoint::{Checkpoint, CheckpointId, LabOpts};
+pub use checkpoint::{Checkpoint, CheckpointId, LabOpts, PrefixMatch, RetainedInput};
 pub use error::LabError;
 pub use event::{Event, EventSink};
 pub use rng::{
