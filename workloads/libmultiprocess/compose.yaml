@@ -1,0 +1,26 @@
+# libmultiprocess workload: one container that signals the bedrock VM ready and
+# then idles. The fuzzer execs the unit-test driver
+# (/opt/bedrock/drivers/singleton_mptest) into it on each iteration; the
+# in-guest workload monitor watches `podman events` and trips a failed
+# assertion if an exec dies non-zero, which the lab reports as a bug (see
+# workloads/README.md — non-zero exit == bug).
+#
+# The podman initrd (nix/podman-initrd.nix) loads bedrock-io.ko before bringing
+# this up, so once the container is running the deterministic I/O channel is live
+# and the lab can drive bash at `host` or at the `mptest` container. No container
+# shuts the VM down on its own — the lab owns lifetime.
+#
+# The image comes from images.tar (built by ./build.sh) — never pulled.
+
+services:
+  mptest:
+    image: bedrock/libmultiprocess:latest
+    pull_policy: never
+    container_name: mptest
+    privileged: true  # Required for VMCALL
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /usr/local/bin/bedrock-ready
+        echo "libmultiprocess: ready signaled, idling"
+        sleep infinity

@@ -104,6 +104,7 @@
         check-stack = checkStack;
         bedrock-cli = userland.bedrock-cli;
         bedrock-determinism = userland.bedrock-determinism;
+        lonepine = userland.lonepine;
         inherit podmanInitrd;
         default = userland.bedrock-cli;
       };
@@ -279,6 +280,29 @@
               exit 1
             fi
             exec ${testBin}/bin/bedrock-integration-tests "$@"
+          '';
+        in {
+          type = "app";
+          program = "${script}";
+        };
+
+        # Coverage-guided workload fuzzer: nix run .#lonepine -- --workload workloads/btcd
+        #
+        # Requires the bedrock module loaded and /dev/bedrock present. Defaults
+        # the guest kernel / initrd to the Nix-built ones; the workload dir (with
+        # its compose.yaml + images.tar, built by the workload's build.sh) is
+        # passed through. Override the kernel/initrd with --vmlinux / --initramfs.
+        lonepine = let
+          script = pkgs.writeShellScript "bedrock-lonepine" ''
+            set -euo pipefail
+            if [ ! -c /dev/bedrock ]; then
+              echo "ERROR: /dev/bedrock not found (load the bedrock module first)" >&2
+              exit 1
+            fi
+            exec ${userland.lonepine}/bin/lonepine \
+              --vmlinux "''${BEDROCK_VMLINUX:-${guestKernel}/vmlinux}" \
+              --initramfs "''${BEDROCK_INITRAMFS:-${podmanInitrd}}" \
+              "$@"
           '';
         in {
           type = "app";
