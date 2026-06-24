@@ -24,12 +24,15 @@ controlled randomness exercises.
 
 `singleton_mptest` is the upstream `mptest` binary. Per
 [`../README.md`](../README.md), the `singleton_` prefix marks it as a unit-test
-driver: on any timeline only one runs at a time, with no other driver alongside
-it. It runs the whole `kj-test` suite and exits non-zero on the first failing
-test; the in-guest workload monitor turns that non-zero exec exit into a failed
-assertion, which the fuzzer reports as a bug (the default workload property —
-any non-zero exit is a bug). The finding's serial log names the failing
-`KJ_TEST(...)`.
+driver: only one runs per timeline, with no other driver alongside it (though
+no-op preemption kicks may interleave to perturb the schedule). It runs the whole
+`kj-test` suite and exits non-zero on the first failing test; the in-guest
+workload monitor turns that non-zero exec exit into a failed assertion, which the
+fuzzer reports as a bug (the default workload property — any non-zero exit is a
+bug). The finding's serial log names the failing `KJ_TEST(...)`.
+
+Interleaving is perturbed two ways: the host `true` preemption-kick driver the
+fuzzer injects, and the pcguard shim's per-edge thread sleeps (see Coverage).
 
 ## Coverage
 
@@ -42,6 +45,16 @@ uninstrumented and reused (via `-DMPGEN_EXECUTABLE`) so no instrumented binary
 ever issues a coverage VMCALL on the build host. Coverage uses the default
 `go-`-less prefix, so run the fuzzer with `--cov-prefix cov-` (or `--cov-prefix ""`
 to match every buffer).
+
+The image also sets `BEDROCK_SCHED_COV=1`, which adds **scheduling coverage**:
+the shim feeds back the order threads are observed running (hashed tid
+transitions — names are useless here, every thread shares the process comm) into
+the same buffer, so a never-seen interleaving counts as new coverage and the
+fuzzer keeps a gradient toward unexplored schedules after edge coverage saturates
+— the high-value signal for these concurrency tests. Two more schedule levers are
+on by default: per-edge thread sleeps (`BEDROCK_SLEEP_*`, above) and the host's
+built-in `anytime_kick` preemption driver (discovered automatically), which the
+fuzzer schedules at any point to perturb the interleaving.
 
 ## Build & run
 

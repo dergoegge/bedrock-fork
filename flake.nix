@@ -181,45 +181,13 @@
           program = "${script}";
         };
 
-        # Boot the concurrency-fuzz workload guest directly on the host:
-        #   nix run .#test-concurrency-fuzz-workload
-        # Requires the bedrock module loaded, /dev/bedrock present, and the
-        # workload image built (./workloads/concurrency-fuzz/build.sh). The
-        # guest kernel must have sched_ext + BTF (see nix/guest-kernel.nix).
-        # Boot it twice and diff the output to check determinism.
-        test-concurrency-fuzz-workload = let
-          script = pkgs.writeShellScript "bedrock-test-concurrency-fuzz-workload" ''
-            set -e
-            export PATH=${pkgs.lib.makeBinPath [ userland.bedrock-cli pkgs.coreutils ]}:$PATH
-
-            echo "=== Bedrock concurrency-fuzz workload ==="
-
-            if ! lsmod | grep -q bedrock; then
-              echo "ERROR: bedrock module not loaded. Run: insmod bedrock.ko"
-              exit 1
-            fi
-            if [ ! -c /dev/bedrock ]; then
-              echo "ERROR: /dev/bedrock not found"
-              exit 1
-            fi
-            if [ ! -f workloads/concurrency-fuzz/images.tar ]; then
-              echo "ERROR: workloads/concurrency-fuzz/images.tar not found." >&2
-              echo "Build it first: ./workloads/concurrency-fuzz/build.sh" >&2
-              exit 1
-            fi
-
-            echo "--- Booting concurrency-fuzz podman guest ---"
-            bedrock-cli -m 5120 \
-              -i ${podmanInitrd} \
-              --file compose.yaml=workloads/concurrency-fuzz/compose.yaml \
-              --file images.tar=workloads/concurrency-fuzz/images.tar \
-              ${guestKernel}/vmlinux
-            echo "=== Concurrency-fuzz workload: OK ==="
-          '';
-        in {
-          type = "app";
-          program = "${script}";
-        };
+        # concurrency-fuzz is a singleton-driver workload (see
+        # workloads/concurrency-fuzz/README.md): the container just signals
+        # ready and idles, so there is no standalone "boot it and watch it
+        # crash" app here anymore — exercise it with
+        #   nix run .#lonepine -- --workload workloads/concurrency-fuzz
+        # (needs ./workloads/concurrency-fuzz/build.sh and a guest kernel with
+        # sched_ext + BTF; see nix/guest-kernel.nix).
 
         # bedrock-lab integration tests: nix run .#integration-tests
         #

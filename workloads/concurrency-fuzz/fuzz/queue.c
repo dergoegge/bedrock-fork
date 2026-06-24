@@ -13,6 +13,11 @@
  * bedrock its clock (clock_gettime(CLOCK_MONOTONIC)) and srand() seed both
  * derive from the deterministic emulated TSC, so the crash reproduces from a
  * fixed scheduler seed.
+ *
+ * The staleness check is reported as an explicit `Always` assertion (see
+ * guest/libassert.h) on every consume, not just the failing one: this gives
+ * lonepine's search a continuous "how close to stale" signal to climb,
+ * instead of only learning about the bug from the process's exit code.
  */
 #include <pthread.h>
 #include <stdint.h>
@@ -20,6 +25,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "libassert.h"
 
 #define ITEM_LIFETIME_MS 1000
 
@@ -80,7 +87,8 @@ static int consume(void)
 
 	long long age = now_ms() - it->timestamp_ms;
 	int value = it->value;
-	if (age >= ITEM_LIFETIME_MS) {
+	if (!bedrock_always_lt(age, ITEM_LIFETIME_MS,
+				"queue: consumed item age is below its lifetime")) {
 		fprintf(stderr, "Item is invalid! age %lldms\n", age);
 		free(it);
 		exit(1);

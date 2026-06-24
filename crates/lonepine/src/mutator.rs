@@ -5,7 +5,8 @@
 //! driver indices, launch offsets, RNG bytes) or the swarm mask, so each edit is
 //! structurally meaningful rather than a raw byte flip on an opaque buffer.
 
-use crate::input::{DriverMask, Member, Plan, Step};
+use crate::driver::DriverKind;
+use crate::input::{DriverMask, Member, Plan, Step, TimelineKind};
 use crate::prng::Rng;
 
 /// Emulated TSC frequency (Hz): the guest's virtual time advances at this fixed
@@ -18,6 +19,11 @@ const TSC_HZ: u64 = 2_995_200_000;
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub n_drivers: usize,
+    /// Kind of each driver, indexed by driver id (`len == n_drivers`). Lets the
+    /// mutator keep a plan homogeneous in its [`TimelineKind`]: a parallel plan
+    /// only ever draws parallel/anytime drivers, a singleton plan only
+    /// singleton/anytime.
+    pub kinds: Vec<DriverKind>,
     pub step_cap: usize,
     pub max_batch: usize,
     /// Tight launch-offset window (ticks) for the Uniform and Quantized offset
@@ -35,15 +41,34 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// Limits for `n_drivers` drivers, all treated as [`DriverKind::Parallel`].
+    /// Used by tests and any all-parallel rule set; the campaign uses
+    /// [`with_kinds`](Self::with_kinds) to carry the real kinds.
     pub fn new(n_drivers: usize) -> Self {
+        Self::with_kinds(vec![DriverKind::Parallel; n_drivers])
+    }
+
+    /// Limits carrying each driver's [`DriverKind`], so the mutator can keep a
+    /// plan homogeneous in its timeline.
+    pub fn with_kinds(kinds: Vec<DriverKind>) -> Self {
         Limits {
-            n_drivers,
+            n_drivers: kinds.len(),
+            kinds,
             step_cap: 50,
             max_batch: 4,
             max_spread: 1_000_000,
             max_offset: 120 * TSC_HZ as i64, // 120 s of virtual time
             max_rng: 256,
             max_stack: 7,
+        }
+    }
+
+    /// Whether a plan of timeline `t` admits a driver of kind `k`. Anytime drivers
+    /// join either timeline; otherwise the driver kind must match the timeline.
+    fn admits(&self, t: TimelineKind, k: DriverKind) -> bool {
+        match t {
+            TimelineKind::Parallel => matches!(k, DriverKind::Parallel | DriverKind::Anytime),
+            TimelineKind::Singleton => matches!(k, DriverKind::Singleton | DriverKind::Anytime),
         }
     }
 }
@@ -135,17 +160,41 @@ fn jitter_near(base: i64, lim: &Limits, rng: &mut Rng) -> i64 {
     (base + delta).clamp(0, lim.max_offset.max(0))
 }
 
-fn random_member(mask: &DriverMask, lim: &Limits, rng: &mut Rng) -> Option<Member> {
-    let driver = mask.pick_enabled(rng)?;
+/// Pick an enabled driver the timeline `kind` admits, uniformly among the
+/// candidates. `None` if the mask enables no driver of an admitted kind (e.g. a
+/// singleton timeline whose only singleton was masked off).
+fn pick_driver(
+    kind: TimelineKind,
+    mask: &DriverMask,
+    lim: &Limits,
+    rng: &mut Rng,
+) -> Option<usize> {
+    let cands: Vec<usize> = mask
+        .enabled_indices()
+        .filter(|&i| lim.admits(kind, lim.kinds[i]))
+        .collect();
+    if cands.is_empty() {
+        return None;
+    }
+    Some(cands[rng.below(cands.len())])
+}
+
+fn random_member(
+    kind: TimelineKind,
+    mask: &DriverMask,
+    lim: &Limits,
+    rng: &mut Rng,
+) -> Option<Member> {
+    let driver = pick_driver(kind, mask, lim, rng)?;
     let offset = choose_offset(lim, rng);
     Some(Member { driver, offset })
 }
 
-fn random_step(mask: &DriverMask, lim: &Limits, rng: &mut Rng) -> Option<Step> {
+fn random_step(kind: TimelineKind, mask: &DriverMask, lim: &Limits, rng: &mut Rng) -> Option<Step> {
     let bsize = 1 + rng.below(lim.max_batch.max(1));
     let mut batch = Vec::new();
     for _ in 0..bsize {
-        if let Some(m) = random_member(mask, lim, rng) {
+        if let Some(m) = random_member(kind, mask, lim, rng) {
             batch.push(m);
         }
     }
@@ -172,6 +221,11 @@ pub fn mutate(parent: &Plan, donor: Option<&Plan>, lim: &Limits, rng: &mut Rng) 
     // Splice can graft in members from a donor whose mask differed; enforce the
     // swarm invariant (members are drawn from the enabled subset) once at the end.
     drop_disabled_members(&mut p);
+    // Then enforce the timeline invariant: a parallel plan carries no singleton,
+    // a singleton plan is one lone-singleton step. Splice/duplicate from a
+    // cross-kind donor can violate it mid-stack; this is the single point that
+    // restores it (mirrors the swarm cleanup above).
+    enforce_timeline(&mut p, lim);
     if p.steps.len() > lim.step_cap {
         p.steps.truncate(lim.step_cap);
     }
@@ -179,12 +233,13 @@ pub fn mutate(parent: &Plan, donor: Option<&Plan>, lim: &Limits, rng: &mut Rng) 
 }
 
 fn apply_one(p: &mut Plan, donor: Option<&Plan>, lim: &Limits, rng: &mut Rng) {
+    let kind = p.kind;
     match rng.below(16) {
         // --- sequence ops ---
         0 => {
             // insert step
             if p.steps.len() < lim.step_cap {
-                if let Some(s) = random_step(&p.mask, lim, rng) {
+                if let Some(s) = random_step(kind, &p.mask, lim, rng) {
                     let at = rng.below(p.steps.len() + 1);
                     p.steps.insert(at, s);
                 }
@@ -233,7 +288,7 @@ fn apply_one(p: &mut Plan, donor: Option<&Plan>, lim: &Limits, rng: &mut Rng) {
             if !p.steps.is_empty() {
                 let s = rng.below(p.steps.len());
                 if p.steps[s].batch.len() < lim.max_batch {
-                    if let Some(m) = random_member(&p.mask, lim, rng) {
+                    if let Some(m) = random_member(kind, &p.mask, lim, rng) {
                         p.steps[s].batch.push(m);
                     }
                 }
@@ -250,12 +305,12 @@ fn apply_one(p: &mut Plan, donor: Option<&Plan>, lim: &Limits, rng: &mut Rng) {
             }
         }
         7 => {
-            // change driver
+            // change driver (to another the timeline admits)
             if !p.steps.is_empty() {
                 let s = rng.below(p.steps.len());
                 if !p.steps[s].batch.is_empty() {
                     let m = rng.below(p.steps[s].batch.len());
-                    if let Some(d) = p.mask.pick_enabled(rng) {
+                    if let Some(d) = pick_driver(kind, &p.mask, lim, rng) {
                         p.steps[s].batch[m].driver = d;
                     }
                 }
@@ -398,11 +453,62 @@ fn havoc_byte_once(buf: &mut Vec<u8>, lim: &Limits, rng: &mut Rng) {
 /// After disabling a driver in the mask, drop any members that referenced it and
 /// any step left with an empty batch. Uses disjoint field borrows.
 fn drop_disabled_members(p: &mut Plan) {
-    let Plan { mask, steps } = p;
+    let Plan { mask, steps, .. } = p;
     for s in steps.iter_mut() {
         s.batch.retain(|m| mask.is_enabled(m.driver));
     }
     steps.retain(|s| !s.batch.is_empty());
+}
+
+/// Restore the [`TimelineKind`] invariant after a free-running mutation stack:
+///
+/// - **parallel** — drop any singleton members (a splice/duplicate from a
+///   cross-kind donor can graft one in) and any step left empty.
+/// - **singleton** — collapse to a single step: the first singleton found, plus
+///   the anytime members of its step (the perturbation that may run alongside a
+///   singleton). If no singleton survives, the plan becomes empty — a valid
+///   singleton seed the next mutation regrows.
+fn enforce_timeline(p: &mut Plan, lim: &Limits) {
+    match p.kind {
+        TimelineKind::Parallel => {
+            for s in p.steps.iter_mut() {
+                s.batch.retain(|m| !lim.kinds[m.driver].is_singleton());
+            }
+            p.steps.retain(|s| !s.batch.is_empty());
+        }
+        TimelineKind::Singleton => match find_first_singleton(p, lim) {
+            Some((si, mi)) => {
+                let step = &p.steps[si];
+                let mut batch = vec![step.batch[mi].clone()];
+                batch.extend(
+                    step.batch
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, m)| *j != mi && lim.kinds[m.driver].is_anytime())
+                        .map(|(_, m)| m.clone()),
+                );
+                let (rng_tape, rand_tape) = (step.rng.clone(), step.rand.clone());
+                p.steps = vec![Step {
+                    batch,
+                    rng: rng_tape,
+                    rand: rand_tape,
+                }];
+            }
+            None => p.steps.clear(),
+        },
+    }
+}
+
+/// Locate the first singleton member `(step_index, member_index)` in plan order.
+fn find_first_singleton(p: &Plan, lim: &Limits) -> Option<(usize, usize)> {
+    for (si, s) in p.steps.iter().enumerate() {
+        for (mi, m) in s.batch.iter().enumerate() {
+            if lim.kinds[m.driver].is_singleton() {
+                return Some((si, mi));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -530,5 +636,71 @@ mod tests {
             max_seen = max_seen.max(p.steps.len());
         }
         assert!(max_seen > 0, "mutator never added a step");
+    }
+
+    #[test]
+    fn timeline_invariant_holds_for_both_kinds() {
+        // 0,1 parallel · 2,3 singleton · 4 anytime.
+        let kinds = vec![
+            DriverKind::Parallel,
+            DriverKind::Parallel,
+            DriverKind::Singleton,
+            DriverKind::Singleton,
+            DriverKind::Anytime,
+        ];
+        let lim = Limits::with_kinds(kinds);
+        let mut rng = Rng::new(0xa11ce);
+
+        // Parallel seed: a parallel plan never contains a singleton driver — even
+        // when spliced against itself.
+        let mut par = Plan::empty(lim.n_drivers);
+        for _ in 0..4000 {
+            let donor = if rng.bool() { Some(par.clone()) } else { None };
+            par = mutate(&par, donor.as_ref(), &lim, &mut rng);
+            assert_eq!(par.kind, TimelineKind::Parallel);
+            for s in &par.steps {
+                for m in &s.batch {
+                    assert!(
+                        !lim.kinds[m.driver].is_singleton(),
+                        "parallel plan must not contain a singleton driver"
+                    );
+                }
+            }
+        }
+
+        // Singleton seed: at most one step; that step has exactly one singleton
+        // (running first) and any other members are anytime. Splicing against a
+        // parallel donor must not leak parallel drivers in.
+        let mut sing = Plan::singleton_seed(lim.n_drivers);
+        let mut saw_singleton = false;
+        for _ in 0..4000 {
+            let donor = if rng.bool() { Some(par.clone()) } else { None };
+            sing = mutate(&sing, donor.as_ref(), &lim, &mut rng);
+            assert_eq!(sing.kind, TimelineKind::Singleton);
+            assert!(sing.steps.len() <= 1, "singleton timeline is a single step");
+            if let Some(s) = sing.steps.first() {
+                let singles = s
+                    .batch
+                    .iter()
+                    .filter(|m| lim.kinds[m.driver].is_singleton())
+                    .count();
+                assert_eq!(singles, 1, "exactly one singleton per singleton step");
+                assert!(
+                    lim.kinds[s.batch[0].driver].is_singleton(),
+                    "the singleton runs first"
+                );
+                assert!(
+                    s.batch[1..]
+                        .iter()
+                        .all(|m| lim.kinds[m.driver].is_anytime()),
+                    "only anytime drivers accompany the singleton"
+                );
+                saw_singleton = true;
+            }
+        }
+        assert!(
+            saw_singleton,
+            "singleton seed should grow a singleton timeline"
+        );
     }
 }

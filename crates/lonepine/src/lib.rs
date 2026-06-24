@@ -12,29 +12,42 @@
 //! makes concurrency bugs reproducible.
 //!
 //! The design is documented under `docs/lonepine/`. The crate is split so the
-//! search logic (input, mutator, coverage, corpus, prng, hash, oracle) is pure
-//! and unit-testable without a VM, while [`campaign`] is the integration layer
-//! that drives `bedrock-lab`.
+//! pure search logic (input, mutator, coverage, oracle, prng, hash) is
+//! unit-testable without a VM; [`feedback`] is the verdict seam over the
+//! coverage/oracle signals; [`executor`] turns a plan into VM execution;
+//! [`solution`] records a finding; [`corpus`] owns the radix-genealogy resume;
+//! [`campaign`] is the integration layer that wires them across workers; and
+//! [`reproduce`] is the read side — replaying a saved finding once to confirm it
+//! still fires (the binary's `--reproduce`).
 //!
 //! [`rewind`]: bedrock_lab::Checkpoint::rewind
 
+pub mod affinity;
 pub mod campaign;
 pub mod corpus;
 pub mod coverage;
+pub mod driver;
+pub mod executor;
+pub mod feedback;
 pub mod hash;
 pub mod input;
 pub mod mutator;
 pub mod oracle;
 pub mod prng;
+pub mod reproduce;
 pub mod rng;
 pub mod shape;
 pub mod sink;
+pub mod solution;
 pub mod ui;
 
-pub use campaign::{run_campaign, Config, Rule};
+pub use campaign::{run_campaign, Config};
 pub use corpus::Corpus;
 pub use coverage::CoverageMap;
-pub use input::{DriverMask, Member, Plan, Step};
+pub use driver::{DriverKind, Rule};
+pub use executor::{ExecOutcome, Executor};
+pub use feedback::Feedback;
+pub use input::{DriverMask, Member, Plan, Step, TimelineKind};
 pub use mutator::{mutate, Limits};
 pub use oracle::Finding;
 pub use prng::Rng;

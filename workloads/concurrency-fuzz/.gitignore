@@ -1,6 +1,10 @@
 images.tar
 
-# Staged by build.sh from guest/libvmcall.h into the Docker build context
-# (single source of truth lives at guest/libvmcall.h). Normally removed on
-# exit; ignored here in case a build is interrupted before cleanup.
+# Staged by build.sh from guest/ into the Docker build context (single
+# sources of truth live there). Normally removed on exit; ignored here in
+# case a build is interrupted before cleanup.
 fuzz/libvmcall.h
+fuzz/libassert.h
+fuzz/libfeedback.h
+fuzz/libfeedback.c
+fuzz/libpcguard.c

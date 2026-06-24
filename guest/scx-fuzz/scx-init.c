@@ -45,17 +45,50 @@
 // — only the starvation schedule below is tuned.
 //
 // "Smooth" profile: many short starvation intervals rather than a few multi-
-// second bursts. With a small STARVE_MAX the 35% budget is split into frequent
+// second bursts. With a small STARVE_MAX the 20% budget is split into frequent
 // small freezes, so the cap-recovery gaps shrink and the perturbation is roughly
-// continuous; the occasional ~1.5s freeze still lets the concurrency-fuzz demo
+// continuous; the occasional ~800ms freeze still lets the concurrency-fuzz demo
 // crash. Faster re-rolls keep the victim set drifting between the closer intervals.
+//
+// STARVE_MAX_NS and STARVE_CAP_PCT were deliberately shrunk from their original
+// values (1500ms / 35%) rather than left at "whatever works": longer freezes
+// and a higher cumulative-starvation cap increase the risk of false-positive
+// timeouts in *other* workloads whose own timeouts are shorter than the freeze
+// they get subjected to (observed in practice). Binary-search results against
+// workloads/concurrency-fuzz (2026-07-03, see its README for the full sweep
+// table) found a much lower RAW floor -- but going there was a trap:
+//   - STARVE_MAX_NS: 500ms fails (0/3), 550ms passes (3/3) -- a sharp cutoff
+//     matching the theoretical minimum stall reclaim_race.c needs (~500ms-1s,
+//     phase-dependent) for its held slot to cycle back to active.
+//   - STARVE_CAP_PCT: 5% fails (0/3), 10-15% passes small samples cleanly.
+//   - BUT 600ms/15% (chosen first, right above that raw floor) turned out to
+//     be intermittently flaky under sustained host load across a long fuzzing
+//     session: 8/8 quick trials (10-14s) right after being tuned, then later
+//     in the SAME session, under no more than ordinary background load, two
+//     more trials took 70-90s (one hit the wall-clock cap outright) with the
+//     IDENTICAL config. A value just barely above an empirically-found floor
+//     is not safe merely because a handful of trials passed fast -- it can
+//     still be one unlucky timing draw away from taking much longer.
+//   - 800ms/20% (this file's values) does NOT show this flakiness: 10/10
+//     trials fast and consistent (10-12s) run in the same session, at the
+//     same time 600ms/15% was struggling. That extra margin above the raw
+//     floor is what actually buys reliability, not the floor number itself.
+//   - LOW_PROB_INV: reducing victim probability below baseline (raising this
+//     value) is NOT safe to lower further -- 1/16 failed 0/3 in testing, so
+//     this stays at its original value; there is no headroom here to shrink.
+// Net effect: STARVE_MAX_NS cut ~47% (1500ms -> 800ms), STARVE_CAP_PCT cut
+// ~43% (35% -> 20%) from the original values, with real margin above the
+// point where things start to break -- not the smallest numbers that
+// technically passed a handful of trials. Do not shrink these further without
+// re-running the sweep across a long, loaded session (a short burst of quick
+// passes is not sufficient evidence of robustness).
 #define STARVE_MIN_NS	(50ULL * 1000000)	// 50ms   starvation interval, low
-#define STARVE_MAX_NS	(1500ULL * 1000000)	// 1.5s   starvation interval, high
+#define STARVE_MAX_NS	(800ULL * 1000000)	// 800ms  starvation interval, high
 #define GAP_MIN_NS	(100ULL * 1000000)	// 100ms  gap between intervals, low
 #define GAP_MAX_NS	(800ULL * 1000000)	// 800ms  gap between intervals, high
 #define PRIO_REROLL_NS	(500ULL * 1000000)	// 0.5s   priority re-randomization
 #define LOW_PROB_INV	8ULL			// P(low) = 1/8 = 0.125
-#define STARVE_CAP_PCT	35ULL			// <= 35% of run time spent starving
+#define STARVE_CAP_PCT	20ULL			// <= 20% of run time spent starving
 
 static volatile sig_atomic_t stop;
 

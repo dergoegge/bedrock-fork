@@ -105,6 +105,23 @@ struct Args {
     #[arg(long = "intercept-pf")]
     intercept_pf: bool,
 
+    /// Workload directory containing `compose.yaml` and `images.tar`. When set,
+    /// the harness serves both files to the guest over the file-transmission
+    /// hypercall — equivalent to passing
+    ///   --file compose.yaml=<dir>/compose.yaml
+    ///   --file images.tar=<dir>/images.tar
+    /// to bedrock-cli. Use this to run a podman workload under the determinism
+    /// checker.
+    #[arg(long = "workload", verbatim_doc_comment)]
+    workload: Option<PathBuf>,
+
+    /// Forward a deterministic I/O channel action to bedrock-cli. Repeatable;
+    /// each value is passed through verbatim as `--io-action <spec>`. See
+    /// `bedrock-cli --help` for the action grammar (e.g.
+    /// 'vt=120.0:exec:bitcoind1:bitcoin-cli getblockchaininfo').
+    #[arg(long = "io-action", verbatim_doc_comment)]
+    io_actions: Vec<String>,
+
     /// Pushover API token for divergence notifications
     #[arg(long = "pushover-token")]
     pushover_token: Option<String>,
@@ -112,6 +129,29 @@ struct Args {
     /// Pushover user key for divergence notifications
     #[arg(long = "pushover-user")]
     pushover_user: Option<String>,
+}
+
+/// Names of the workload files served over the file-transmission hypercall
+/// when `--workload <dir>` is given. Each maps to `<dir>/<name>`.
+const WORKLOAD_FILES: [&str; 2] = ["compose.yaml", "images.tar"];
+
+impl Args {
+    /// Resolve `--workload <dir>` into the `(guest-name, host-path)` pairs the
+    /// CLI serves over the file-transmission hypercall. Empty when no workload
+    /// is set. Host paths are made absolute so the spawned CLI resolves them
+    /// regardless of its working directory.
+    fn workload_file_args(&self) -> Vec<(String, String)> {
+        match &self.workload {
+            Some(dir) => WORKLOAD_FILES
+                .iter()
+                .map(|name| {
+                    let host = make_absolute(&dir.join(name).to_string_lossy());
+                    (name.to_string(), host.to_string_lossy().into_owned())
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// Parse a u64 value from a string, supporting hex (0x prefix) and decimal.
@@ -540,6 +580,21 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
+    // Verify workload files exist before doing any work, so a typo in
+    // --workload fails fast rather than every run failing inside the CLI.
+    if let Some(dir) = &args.workload {
+        for name in WORKLOAD_FILES {
+            let path = dir.join(name);
+            if !path.exists() {
+                eprintln!(
+                    "Error: --workload {:?} is missing {} (expected {:?})",
+                    dir, name, path
+                );
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+
     // Verify parent VM exists before doing any filesystem work.
     // Attempt a transient fork; drop it immediately on success.
     if let Some(parent_id) = args.parent_id {
@@ -652,6 +707,12 @@ fn write_config_file(args: &Args, vmlinux: &str, cli_path: &Path) -> io::Result<
     }
     if args.intercept_pf {
         writeln!(f, "intercept_pf: true")?;
+    }
+    if let Some(ref workload) = args.workload {
+        writeln!(f, "workload: {}", workload.display())?;
+    }
+    for action in &args.io_actions {
+        writeln!(f, "io_action: {}", action)?;
     }
     writeln!(f, "parallel: {}", args.parallel)?;
     writeln!(f, "wall_clock_timeout: {}s", args.wall_clock_timeout)?;
@@ -888,6 +949,8 @@ fn run_parallel(args: &Args, vmlinux: &str, cli_path: &Path) -> std::process::Ex
             let all_exits = args.all_exits;
             let no_memory_hash = args.no_memory_hash;
             let intercept_pf = args.intercept_pf;
+            let workload_files = args.workload_file_args();
+            let io_actions = args.io_actions.clone();
 
             thread::spawn(move || {
                 let result = run_vm_inner(
@@ -905,6 +968,8 @@ fn run_parallel(args: &Args, vmlinux: &str, cli_path: &Path) -> std::process::Ex
                     all_exits,
                     no_memory_hash,
                     intercept_pf,
+                    &workload_files,
+                    &io_actions,
                     &cli_path,
                     &workdir,
                     run_num,
@@ -1090,6 +1155,8 @@ fn run_vm(
         args.all_exits,
         args.no_memory_hash,
         args.intercept_pf,
+        &args.workload_file_args(),
+        &args.io_actions,
         cli_path,
         &args.workdir,
         run_num,
@@ -1112,6 +1179,8 @@ fn run_vm_inner(
     all_exits: bool,
     no_memory_hash: bool,
     intercept_pf: bool,
+    workload_files: &[(String, String)],
+    io_actions: &[String],
     cli_path: &Path,
     workdir: &Path,
     run_num: usize,
@@ -1183,6 +1252,16 @@ fn run_vm_inner(
         cmd.arg("--parent-id").arg(id.to_string());
     }
     cmd.arg("--wall-clock-timeout").arg(timeout.to_string());
+
+    // Serve workload files (compose.yaml / images.tar) over the
+    // file-transmission hypercall, and forward any I/O channel actions. Both
+    // must be identical across runs for determinism comparison to be valid.
+    for (name, path) in workload_files {
+        cmd.arg("--file").arg(format!("{}={}", name, path));
+    }
+    for action in io_actions {
+        cmd.arg("--io-action").arg(action);
+    }
 
     let exit_stats_file = run_dir.join("exit-stats.json");
     cmd.arg("--exit-stats-json").arg(&exit_stats_file);

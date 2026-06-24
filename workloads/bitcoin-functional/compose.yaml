@@ -1,0 +1,32 @@
+# Bitcoin Core functional-test workload: one container that signals the bedrock
+# VM ready and then idles. The fuzzer execs the functional-test driver
+# (/opt/bedrock/drivers/singleton_p2p_orphan_handling) into it on each iteration;
+# the in-guest workload monitor watches `podman events` and trips a failed
+# assertion if an exec dies non-zero, which the lab reports as a bug (see
+# workloads/README.md — non-zero exit == bug).
+#
+# The driver starts a regtest bitcoind itself (via the upstream functional-test
+# framework) and drives it over a Python P2P connection, so no bitcoind runs
+# until a driver does. The first driver run in each forked timeline builds the
+# shared 199-block regtest cache under /opt/bitcoin/test/cache; subsequent state
+# is per-timeline VM memory.
+#
+# The podman initrd (nix/podman-initrd.nix) loads bedrock-io.ko before bringing
+# this up, so once the container is running the deterministic I/O channel is live
+# and the lab can drive bash at `host` or at the `bitcoin` container. No container
+# shuts the VM down on its own — the lab owns lifetime.
+#
+# The image comes from images.tar (built by ./build.sh) — never pulled.
+
+services:
+  bitcoin:
+    image: bedrock/bitcoin-functional:latest
+    pull_policy: never
+    container_name: bitcoin
+    privileged: true  # Required for VMCALL
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /usr/local/bin/bedrock-ready
+        echo "bitcoin-functional: ready signaled, idling"
+        sleep infinity

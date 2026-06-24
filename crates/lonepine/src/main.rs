@@ -70,15 +70,43 @@ struct Args {
     #[arg(long = "branch-budget-secs", default_value_t = 600)]
     branch_budget_secs: u64,
 
+    /// Settle window (virtual seconds) to keep running each step after its
+    /// drivers finish, so the guest's async assertion pipeline surfaces a
+    /// failure on serial before the oracle reads it. 0 disables it.
+    #[arg(long = "quiesce-secs", default_value_t = 5.0)]
+    quiesce_secs: f64,
+
     /// Max live VM checkpoint tips kept in the corpus (others are dropped and
-    /// revived on demand via the radix genealogy). Bounds cached VM memory.
+    /// revived on demand via the radix genealogy). Bounds cached VM memory
+    /// regardless of --cores.
     #[arg(long = "cache-budget", default_value_t = 512)]
     cache_budget: usize,
 
-    /// Directory to write reproducers to: `crash-<n>.json` (raw, saved as soon
-    /// as a bug is found), `crash-<n>.serial.log`, and `crash-<n>.min.json`.
+    /// Number of parallel fuzzing workers. All share one ready checkpoint, the
+    /// coverage map, and the corpus; only each worker's PRNG is private.
+    #[arg(long, default_value_t = 1)]
+    cores: usize,
+
+    /// Directory to write reproducers to. Each bug is named by a content hash of
+    /// its inputs: `bug-<hash>.json` (raw, saved as soon as a bug is found),
+    /// `bug-<hash>.serial.log`, and `bug-<hash>.min.json`.
     #[arg(long = "solutions-dir", default_value = "lonepine-solutions")]
     solutions_dir: String,
+
+    /// Replay a saved reproducer (a `bug-<hash>.json` / `bug-<hash>.min.json`)
+    /// once and report whether its recorded finding still fires, instead of
+    /// running a campaign. Needs the same `--vmlinux` / `--initramfs` / workload
+    /// that produced it. Exits non-zero if the finding does not reproduce.
+    #[arg(long)]
+    reproduce: Option<PathBuf>,
+
+    /// Diagnostic for `--reproduce`: capture APIC-timer injections and report
+    /// every large emulated-TSC gap between consecutive captured events. Each
+    /// timer injection records the deadline it fired for, so an idle
+    /// over-advance (a short guest sleep whose timer was armed far in the
+    /// future) surfaces as a single flagged gap with its deadline.
+    #[arg(long = "trace-injects")]
+    trace_injects: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -112,9 +140,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         driver_dir: args.driver_dir,
         cov_prefix: args.cov_prefix.into_bytes(),
         branch_budget_secs: args.branch_budget_secs,
+        quiesce_secs: args.quiesce_secs,
         cache_budget: args.cache_budget,
+        cores: args.cores,
         solutions_dir: args.solutions_dir,
+        trace_injects: args.trace_injects,
         ..Config::default()
     };
+
+    // `--reproduce <file>` replays one saved finding against a fresh boot of the
+    // same workload instead of running a campaign.
+    if let Some(path) = args.reproduce {
+        return lonepine::reproduce::reproduce(&cfg, &path);
+    }
     run_campaign(cfg)
 }

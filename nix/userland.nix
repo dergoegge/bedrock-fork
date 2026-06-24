@@ -23,6 +23,10 @@ in
     inherit src;
     cargoLock.lockFile = ../Cargo.lock;
     cargoBuildFlags = [ "-p" "bedrock-cli" ];
+    # Build the binary only — don't run the (unscoped) workspace test suite,
+    # which gates the build on unrelated crates' tests (e.g. bedrock-vmx's
+    # flaky global-VPID-allocator test). Tests run via `just test`.
+    doCheck = false;
     meta.mainProgram = "bedrock-cli";
   };
 
@@ -32,6 +36,7 @@ in
     inherit src;
     cargoLock.lockFile = ../Cargo.lock;
     cargoBuildFlags = [ "-p" "bedrock-determinism-tests" ];
+    doCheck = false;
     meta.mainProgram = "bedrock-determinism";
   };
 

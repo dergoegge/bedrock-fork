@@ -12,6 +12,7 @@
 //! The lab records everything both return, so after the step the realized
 //! consumption is captured back into the plan — no length cap, no exhaustion.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bedrock_lab::InputSource;
@@ -25,6 +26,13 @@ pub struct ReplayThenFresh {
     rand_tape: Arc<Vec<u8>>,
     rand_pos: usize,
     fresh: Rng,
+    /// Count of bytes served from the fresh PRNG past the end of either recorded
+    /// tape. Shared across clones (see [`InputSource::clone_box`]) so the caller
+    /// can read the total after the branch — and any of its forked sub-branches —
+    /// has run. During a campaign, drawing fresh is the normal way exploration
+    /// pushes past a recording; during reproduce it is a hard failure, because the
+    /// saved recording is supposed to contain every byte the guest consumed.
+    overrun: Arc<AtomicU64>,
 }
 
 impl ReplayThenFresh {
@@ -38,7 +46,15 @@ impl ReplayThenFresh {
             rand_tape: Arc::new(rand),
             rand_pos: 0,
             fresh: Rng::new(seed),
+            overrun: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// A handle to this source's fresh-byte counter, shared with every clone.
+    /// Read it after the branch has run to learn how many bytes were served past
+    /// the recorded tapes (`0` == the recording covered every draw).
+    pub fn overrun_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.overrun)
     }
 }
 
@@ -53,6 +69,7 @@ impl InputSource for ReplayThenFresh {
         } else {
             // Past the recording: generate fresh. The lab records the value, so
             // a later replay reads it from the tape and never reaches here.
+            self.overrun.fetch_add(8, Ordering::Relaxed);
             Some(self.fresh.next_u64())
         }
     }
@@ -71,10 +88,13 @@ impl InputSource for ReplayThenFresh {
             let remaining = self.rand_tape.get(self.rand_pos..).unwrap_or(&[]);
             out.extend_from_slice(remaining);
             self.rand_pos = self.rand_tape.len();
+            let fresh_start = out.len();
             while out.len() < len {
                 out.extend_from_slice(&self.fresh.next_u64().to_le_bytes());
             }
             out.truncate(len);
+            self.overrun
+                .fetch_add((len - fresh_start) as u64, Ordering::Relaxed);
         }
         out
     }
@@ -127,5 +147,34 @@ mod tests {
         // Same seed => same fresh stream; independent cursors.
         assert_eq!(a.next_rng_u64(), b.next_rng_u64());
         assert_eq!(a.next_random(8, 0), b.next_random(8, 0));
+    }
+
+    #[test]
+    fn overrun_counts_only_fresh_bytes() {
+        // Draws fully inside the recorded tapes never touch the fresh PRNG.
+        let mut t = ReplayThenFresh::new(7u64.to_le_bytes().to_vec(), vec![1, 2, 3, 4], 0);
+        let overrun = t.overrun_handle();
+        assert_eq!(t.next_rng_u64(), Some(7));
+        assert_eq!(t.next_random(4, 0), vec![1, 2, 3, 4]);
+        assert_eq!(overrun.load(Ordering::Relaxed), 0, "stayed within the tape");
+
+        // Drawing past the rng tape adds 8 (one fresh u64); a 6-byte getrandom
+        // request fully past its tape adds 6.
+        t.next_rng_u64();
+        t.next_random(6, 0);
+        assert_eq!(overrun.load(Ordering::Relaxed), 8 + 6);
+    }
+
+    #[test]
+    fn overrun_is_shared_across_clones() {
+        let a = ReplayThenFresh::new(vec![], vec![], 1);
+        let overrun = a.overrun_handle();
+        let mut b = a.clone(); // a forked sub-branch
+        b.next_rng_u64(); // fresh draw on the clone
+        assert_eq!(
+            overrun.load(Ordering::Relaxed),
+            8,
+            "a clone's overrun is visible through the original's handle"
+        );
     }
 }

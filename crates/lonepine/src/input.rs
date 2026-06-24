@@ -122,17 +122,46 @@ impl Step {
     }
 }
 
+/// Which kind of timeline a [`Plan`] is — the homogeneity invariant the mutator
+/// maintains. A plan is *either* a parallel timeline (parallel + anytime drivers
+/// across a sequence of steps) *or* a singleton timeline (one singleton driver,
+/// alone, plus anytime drivers, in a single terminal step). Anytime drivers join
+/// either; singleton and parallel drivers never share a plan. Fixed at creation
+/// and inherited by mutation, so the two never mix. (The driver *kinds* live in
+/// [`crate::driver`]; this is the plan-level shape they imply.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineKind {
+    Parallel,
+    Singleton,
+}
+
 /// A complete fuzzer input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
+    /// The timeline this plan belongs to. Fixed at creation; the mutator keeps
+    /// every plan homogeneous in it.
+    pub kind: TimelineKind,
     pub mask: DriverMask,
     pub steps: Vec<Step>,
 }
 
 impl Plan {
-    /// An empty plan with every driver enabled — the campaign's initial seed.
+    /// An empty parallel-timeline plan with every driver enabled — the campaign's
+    /// initial parallel seed.
     pub fn empty(n_drivers: usize) -> Self {
         Plan {
+            kind: TimelineKind::Parallel,
+            mask: DriverMask::all(n_drivers),
+            steps: Vec::new(),
+        }
+    }
+
+    /// An empty singleton-timeline seed. The mutator grows it into a lone
+    /// singleton driver (plus optional anytime perturbation); seeded only when the
+    /// workload has at least one singleton driver.
+    pub fn singleton_seed(n_drivers: usize) -> Self {
+        Plan {
+            kind: TimelineKind::Singleton,
             mask: DriverMask::all(n_drivers),
             steps: Vec::new(),
         }
@@ -150,6 +179,23 @@ impl Plan {
     /// current `rng`).
     pub fn edges(&self) -> Vec<u128> {
         self.steps.iter().map(|s| s.edge_hash()).collect()
+    }
+
+    /// A stable content hash of the plan's inputs: the ordered sequence of step
+    /// edge-hashes (driver batch + both randomness tapes). Two plans that execute
+    /// identically hash the same, so a finding's reproducer files can be named by
+    /// it (`bug-<hash>`) — content-derived and stable across runs and cores,
+    /// rather than a per-run `crash-<counter>`. The timeline `kind` and driver
+    /// `mask` are excluded for the same reason [`Step::edge_hash`] excludes the
+    /// mask: neither affects what executes.
+    pub fn input_hash(&self) -> u128 {
+        // Domain-separated seed so an empty plan still has a well-defined,
+        // non-zero hash distinct from other FNV uses.
+        let mut h = fnv1a_128(b"lonepine-plan-input");
+        for s in &self.steps {
+            h = crate::hash::combine(h, s.edge_hash());
+        }
+        h
     }
 }
 
@@ -224,6 +270,7 @@ mod tests {
             rand: vec![],
         };
         let mut a = Plan {
+            kind: TimelineKind::Parallel,
             mask: DriverMask::all(3),
             steps: vec![step.clone()],
         };
@@ -231,5 +278,37 @@ mod tests {
         a.mask.set(2, false);
         b.mask.set(1, false);
         assert_eq!(a.edges(), b.edges());
+    }
+
+    #[test]
+    fn input_hash_stable_and_input_sensitive() {
+        let step = |driver, offset, rand: Vec<u8>| Step {
+            batch: vec![Member { driver, offset }],
+            rng: vec![],
+            rand,
+        };
+        let plan = |steps| Plan {
+            kind: TimelineKind::Parallel,
+            mask: DriverMask::all(3),
+            steps,
+        };
+
+        let a = plan(vec![step(1, 0, vec![1, 2]), step(0, 5, vec![])]);
+        // Same inputs (even with a different mask) hash the same.
+        let mut a2 = a.clone();
+        a2.mask.set(2, false);
+        assert_eq!(a.input_hash(), a2.input_hash());
+
+        // Order of steps matters.
+        let reordered = plan(vec![step(0, 5, vec![]), step(1, 0, vec![1, 2])]);
+        assert_ne!(a.input_hash(), reordered.input_hash());
+
+        // A changed randomness tape changes the hash.
+        let diff_rand = plan(vec![step(1, 0, vec![1, 3]), step(0, 5, vec![])]);
+        assert_ne!(a.input_hash(), diff_rand.input_hash());
+
+        // The empty plan has a well-defined, non-zero, stable hash.
+        assert_eq!(plan(vec![]).input_hash(), plan(vec![]).input_hash());
+        assert_ne!(plan(vec![]).input_hash(), 0);
     }
 }

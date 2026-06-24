@@ -179,6 +179,47 @@ typedef unsigned long long vmcall_u64;
 #define VMCALL_FILE_STORE_IO_ERROR (-1LL)
 
 /* ------------------------------------------------------------------------- */
+/* Hypervisor detection.                                                     */
+/*                                                                           */
+/* VMCALL is only valid in VMX non-root operation; executed anywhere else it */
+/* faults (#UD from CPL 3, delivered as SIGILL). Guest code that may *also*   */
+/* run on a normal host must gate its hypercalls on this probe. The classic   */
+/* in-VM signal (CPUID.01H:ECX[31], the hypervisor-present bit) is not enough */
+/* here: a build host that is itself a VM (e.g. cloud KVM) sets it too, yet a */
+/* userspace VMCALL still #UDs there. So we identify *bedrock specifically*    */
+/* by its emulated processor brand string, "Bedrock VM CPU", returned from    */
+/* the extended brand-string leaves 0x80000002..0x80000004 (see              */
+/* crates/bedrock-vmx/src/exits/cpuid.rs). Any other environment — bare metal */
+/* or a different hypervisor — reports its real CPU brand, so the check is     */
+/* false and the caller skips the faulting VMCALL.                           */
+/* ------------------------------------------------------------------------- */
+
+#if defined(__x86_64__) || defined(__i386__)
+static inline int vmcall_bedrock_present(void)
+{
+	unsigned int eax, ebx, ecx, edx;
+
+	/* Is the brand-string leaf even available? */
+	__asm__ __volatile__("cpuid"
+			     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+			     : "a"(0x80000000U), "c"(0U));
+	if (eax < 0x80000004U)
+		return 0;
+
+	/* Leaf 0x80000002 holds the first 16 brand bytes as little-endian
+	 * dwords. "Bedrock VM C" (the first 12) is a unique bedrock marker. */
+	__asm__ __volatile__("cpuid"
+			     : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+			     : "a"(0x80000002U), "c"(0U));
+	return eax == 0x72646542U /* "Bedr" */ &&
+	       ebx == 0x206b636fU /* "ock " */ &&
+	       ecx == 0x43204d56U /* "VM C" */;
+}
+#else
+static inline int vmcall_bedrock_present(void) { return 0; }
+#endif
+
+/* ------------------------------------------------------------------------- */
 /* Generic VMCALL primitives — hypercall number plus up to five arguments.   */
 /*                                                                           */
 /* The "memory" clobber inside these is load-bearing: it forces the compiler */

@@ -1,0 +1,9 @@
+images.tar
+
+# Staged by build.sh from guest/ into this Docker build context (single source
+# of truth lives under guest/). Normally removed on exit; ignored here in case a
+# build is interrupted before cleanup.
+libvmcall.h
+libfeedback.h
+libfeedback.c
+libpcguard.c

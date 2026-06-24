@@ -140,6 +140,17 @@ mkdir -p /bedrock
 # it before any container starts, for the same reason as the assertion sink.
 mkdir -p /bedrock/coverage
 
+# Host-side fuzzer driver dir. lonepine discovers drivers under
+# /opt/bedrock/drivers on the host and in each container, classifying each by its
+# name prefix. anytime_kick is the built-in preemption driver — an `anytime_`
+# driver (runnable at any point on any timeline) whose body is a no-op:
+# scheduling it lands an I/O-channel IRQ that forces a guest reschedule, a free
+# lever on thread interleaving. Created here, in the post-switch_root root the
+# fuzzer enumerates, so it doesn't depend on the Stage 1 copy list.
+mkdir -p /opt/bedrock/drivers
+printf '#!/bin/sh\nexit 0\n' > /opt/bedrock/drivers/anytime_kick
+chmod +x /opt/bedrock/drivers/anytime_kick
+
 # Surface the assertion sink in the guest log: follow it and pipe each line
 # through `systemd-cat` into the journal under the `assertions` tag, so the
 # journalctl formatter below renders every assertion (host- or

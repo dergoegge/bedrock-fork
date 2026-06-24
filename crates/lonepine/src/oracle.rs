@@ -46,14 +46,41 @@ impl Finding {
             Finding::Assertion { .. } => "assertion",
         }
     }
+
+    /// Human-readable reason: the assertion message, or `"vm fault"`. Used both
+    /// as the dedup key (findings dedup by reason) and the reproducer's reason.
+    pub fn reason(&self) -> String {
+        match self {
+            Finding::Assertion { message, .. } => message.clone(),
+            Finding::VmFault { .. } => "vm fault".to_string(),
+        }
+    }
 }
 
-/// Parse the assertion record carried by one serial line, if any. The record is
-/// the trailing JSON object; any formatter/branch prefix before it contains no
-/// `{`. Returns `None` for lines without a parseable assertion.
+/// Parse the assertion record carried by one serial line, if any. Returns `None`
+/// for lines without a parseable assertion.
+///
+/// The guest renders its journal to the console as compact JSON records —
+/// `journalctl -o json | jq -cM '{SYSLOG_IDENTIFIER, MESSAGE}'` — so a captured
+/// serial line is `{"SYSLOG_IDENTIFIER":"assertions","MESSAGE":"<assertion json>"}`
+/// with the assertion JSON nested (escaped) inside `MESSAGE`. Unwrap that first;
+/// fall back to a bare assertion object (a producer that writes the assertion
+/// directly to the console, and the unit tests). Any branch/formatter prefix
+/// before the first `{` is skipped.
 fn parse_assertion(line: &str) -> Option<Assertion> {
     let stripped = strip_ansi(line);
     let json = stripped.get(stripped.find('{')?..)?;
+    // Journal-record wrapping: pull the assertion out of `MESSAGE`.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
+        if let Some(msg) = value.get("MESSAGE").and_then(|m| m.as_str()) {
+            if let Some(start) = msg.find('{') {
+                if let Ok(a) = serde_json::from_str::<Assertion>(&msg[start..]) {
+                    return Some(a);
+                }
+            }
+        }
+    }
+    // Fallback: the line is the bare assertion object.
     serde_json::from_str::<Assertion>(json).ok()
 }
 
@@ -138,6 +165,25 @@ mod tests {
             assertion_failure_reason(&[line]).as_deref(),
             Some("container btcd1 exit code is zero")
         );
+    }
+
+    #[test]
+    fn failed_always_detected_when_wrapped_in_journal_record() {
+        // The real shape the fuzzer captures off serial: the guest's
+        // `journalctl -o json | jq '{SYSLOG_IDENTIFIER, MESSAGE}'` record, with
+        // the assertion JSON nested (escaped) inside MESSAGE, behind the sink's
+        // own `[br .. vt ..]` prefix.
+        let line = r#"[br BranchId(7) vt   12.345] {"SYSLOG_IDENTIFIER":"assertions","MESSAGE":"{\"Always\":{\"condition\":{\"Eq\":{\"x\":1,\"y\":0}},\"result\":false,\"message\":\"exec exit code is zero\",\"location\":{\"file\":\"m.rs\",\"line\":1,\"column\":1}}}"}"#;
+        assert_eq!(
+            assertion_failure_reason(&[line.to_string()]).as_deref(),
+            Some("exec exit code is zero")
+        );
+    }
+
+    #[test]
+    fn passing_always_wrapped_in_journal_record_is_ignored() {
+        let line = r#"{"SYSLOG_IDENTIFIER":"assertions","MESSAGE":"{\"Always\":{\"condition\":{\"Eq\":{\"x\":0,\"y\":0}},\"result\":true,\"message\":\"exec exit code is zero\",\"location\":{\"file\":\"m.rs\",\"line\":1,\"column\":1}}}"}"#;
+        assert_eq!(assertion_failure_reason(&[line.to_string()]), None);
     }
 
     #[test]

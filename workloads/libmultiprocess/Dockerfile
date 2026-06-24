@@ -47,7 +47,7 @@ RUN clang-19 -O2 -I/src -c libpcguard.c -o /src/libpcguard.o \
  && clang-19 -O2 -I/src -c libfeedback.c -o /src/libfeedback.o
 
 ARG LIBMP_REF
-RUN git clone https://github.com/bitcoin-core/libmultiprocess /src/libmp \
+RUN git clone --branch v10 https://github.com/bitcoin-core/libmultiprocess /src/libmp \
  && git -C /src/libmp checkout "$LIBMP_REF"
 
 # Pass 1 — build an UNINSTRUMENTED mpgen. mpgen is the Cap'n Proto proxy-code
@@ -89,10 +89,24 @@ FROM alpine:3.21
 # Runtime libraries for the dynamically-linked test binary (same alpine release,
 # so the Cap'n Proto/kj shared libs match the build's).
 RUN apk add --no-cache libstdc++ capnproto
+# Enable the pcguard shim's thread-sleep injection for the test drivers: each
+# instrumented edge has a ~1/1000 chance of a nanosleep up to 50ms guest-time,
+# seeded per-thread from the fuzzer-controlled getrandom channel — a fine-grained,
+# deterministic, steerable perturbation of mptest's thread interleaving (see
+# guest/libpcguard.c). `podman exec` inherits image ENV, so the drivers pick it
+# up. Tune the rate with BEDROCK_SLEEP_PERIOD (raise to sleep less, lower to
+# sleep more; unset to disable) and the max sleep with BEDROCK_SLEEP_MAX_US.
+# BEDROCK_SCHED_COV=1 also feeds back the order threads are observed running
+# (hashed tid transitions) as coverage, so the fuzzer keeps exploring new
+# interleavings after edge coverage saturates (see guest/libpcguard.c).
+ENV BEDROCK_SLEEP_PERIOD=1000 \
+    BEDROCK_SLEEP_MAX_US=50000 \
+    BEDROCK_SCHED_COV=1
 COPY --from=build /bedrock-ready /usr/local/bin/bedrock-ready
 # The instrumented test binary, installed as a singleton driver. `singleton_`
 # marks it as a unit-test driver: on any timeline only one runs at a time and no
 # other driver runs alongside it (see workloads/README.md).
 COPY --from=build /mptest /opt/bedrock/drivers/singleton_mptest
+
 # Overridden by compose; a sane default so the container idles if run directly.
 ENTRYPOINT ["/bin/sh", "-c", "sleep infinity"]

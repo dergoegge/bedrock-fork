@@ -166,6 +166,19 @@ uint8_t *feedback_buffer_init(size_t num_edges, const char *build_id) {
         return coverage_buffer;
     }
 
+    // Coverage is collected only inside the bedrock hypervisor. Registration
+    // (like every hypercall) issues VMCALL, which faults (#UD -> SIGILL)
+    // anywhere else. Instrumented binaries are routinely run *outside* the
+    // guest — at container build time, code generators and test programs
+    // execute on the build host — so when bedrock isn't detected, leave the
+    // buffer NULL and let feedback_record() no-op rather than crash the
+    // process. (See vmcall_bedrock_present() / crates/bedrock-vmx/src/exits/
+    // cpuid.rs.) init_started stays set, so later frontend _init calls also
+    // short-circuit here.
+    if (!vmcall_bedrock_present()) {
+        return NULL;
+    }
+
     // "cov-<build>", staged on the (resident) stack: the host reads the id by
     // walking the guest page tables and can't fault a not-present page in.
     char id[VMCALL_FEEDBACK_BUFFER_ID_MAX_LEN];
