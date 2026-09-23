@@ -1,0 +1,15 @@
+[package]
+name = "bedrock-afl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AFL++ snapshot execution backend for Bedrock"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bedrock-lab = { path = "../bedrock-lab" }
+bedrock-vm = { path = "../bedrock-vm" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

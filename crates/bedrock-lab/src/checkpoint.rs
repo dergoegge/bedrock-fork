@@ -299,6 +299,41 @@ impl Checkpoint {
         self.inner.lab.tsc_frequency
     }
 
+    /// This checkpoint's global VM id (from the kernel module), for forking from
+    /// another process via [`attach_forked`](Self::attach_forked).
+    pub fn vm_id(&self) -> Result<u64> {
+        self.inner.vm.get_vm_id().map_err(|source| {
+            LabError::Vm(VmError::Ioctl {
+                operation: "GET_VM_ID",
+                source,
+            })
+        })
+    }
+
+    /// Build a checkpoint that forks from a root VM owned by *another process*,
+    /// identified by its global [`vm_id`](Self::vm_id).
+    ///
+    /// The root must be parked at its fuzz-input checkpoint and never run again
+    /// (a parent VM cannot be run while it has forked children). Each
+    /// [`branch`](Self::branch) then forks a fresh child at that state. This is
+    /// how a multi-process campaign shares one booted root VM: one holder
+    /// process boots to the checkpoint and publishes its `vm_id`; every worker
+    /// process attaches with this id and forks per testcase, so the expensive
+    /// boot happens once.
+    ///
+    /// RNG mode and every buffer registration are inherited through the fork, so
+    /// no [`InputSource`](crate::InputSource) is attached (kernel-side seeded
+    /// randomness carries through). `at` is the parent's checkpoint virtual time.
+    pub fn attach_forked(parent_id: u64, at: VirtTime, opts: LabOpts) -> Result<Self> {
+        let vm = Vm::create_forked(parent_id).map_err(|source| {
+            LabError::Vm(VmError::Ioctl {
+                operation: "CREATE_FORKED_VM",
+                source,
+            })
+        })?;
+        Self::initial_at_with_configured_rng(vm, at, opts, PartialLine::default(), None)
+    }
+
     /// Inputs consumed along the path to this checkpoint.
     pub fn input_recording(&self) -> &InputRecording {
         &self.inner.input_recording
